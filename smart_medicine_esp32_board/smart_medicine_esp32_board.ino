@@ -5,11 +5,11 @@
 #define LED 22
 #define BUZZER 21
 
-const char* ssid = "YOUR_WIFI_NAME";
-const char* password = "YOUR_WIFI_PASSWORD";
+const char* ssid = "WIFI_NAME";
+const char* password = "WIFI_PASSWORD";
 
-// Your backend API endpoint
-const char* serverURL = "http://your-server-url/api/medicine";
+// backend API endpoint
+const char* serverURL = "url";
 
 bool alarmActive = true;
 
@@ -20,7 +20,7 @@ void setup() {
   pinMode(LED, OUTPUT);
   pinMode(BUZZER, OUTPUT);
 
-  // Connect to WiFi
+  // to connect to wiFi
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
 
@@ -47,7 +47,7 @@ void loop() {
     digitalWrite(LED, LOW);
     noTone(BUZZER);
 
-    // Send data to backend
+    // send data to backend
     if (WiFi.status() == WL_CONNECTED) {
       HTTPClient http;
 
