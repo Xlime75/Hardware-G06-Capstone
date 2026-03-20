@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include "time.h"
 
 #define LIMIT_SWITCH 23
 #define LED 22
@@ -8,10 +9,20 @@
 const char* ssid = "WIFI_NAME";
 const char* password = "WIFI_PASSWORD";
 
-// backend API endpoint
+// Backend API
 const char* serverURL = "url";
 
-bool alarmActive = true;
+// NTP Config
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 8 * 3600; // Philippines
+const int daylightOffset_sec = 0;
+
+// Alarm time (will get the time from the system later)
+int alarmHour = 7;
+int alarmMinute = 0;
+
+bool alarmActive = false;
+bool alarmTriggered = false;
 
 void setup() {
   Serial.begin(115200);
@@ -20,7 +31,7 @@ void setup() {
   pinMode(LED, OUTPUT);
   pinMode(BUZZER, OUTPUT);
 
-  // to connect to wiFi
+  // To connect to wiFi
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
 
@@ -30,17 +41,46 @@ void setup() {
   }
 
   Serial.println("\nConnected to WiFi!");
+
+  // NTP INIT
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("Syncing time...");
+  delay(2000);
 }
 
 void loop() {
-  int switchState = digitalRead(LIMIT_SWITCH);
+  struct tm timeinfo;
 
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to get time");
+    return;
+  }
+
+  int currentHour = timeinfo.tm_hour;
+  int currentMinute = timeinfo.tm_min;
+  int currentSecond = timeinfo.tm_sec;
+
+  Serial.printf("Time: %02d:%02d:%02d\n", currentHour, currentMinute, currentSecond);
+
+  // Alarm logic
+  if (currentHour == alarmHour && currentMinute == alarmMinute) {
+    if (!alarmTriggered) {
+      Serial.println("ALARM STARTED");
+      alarmActive = true;
+      alarmTriggered = true;
+    }
+  } else {
+    alarmTriggered = false; // reset for next trigger
+  }
+
+  // Alarm
   if (alarmActive) {
     digitalWrite(LED, HIGH);
     tone(BUZZER, 1000);
   }
 
-  if (switchState == LOW) {
+  // Medicine taken (limit switch)
+  if (digitalRead(LIMIT_SWITCH) == LOW && alarmActive) {
     Serial.println("Medicine Taken!");
 
     alarmActive = false;
@@ -64,8 +104,8 @@ void loop() {
       http.end();
     }
 
-    delay(3000);
+    delay(3000); // debounce / cooldown
   }
 
-  delay(200);
+  delay(1000);
 }
