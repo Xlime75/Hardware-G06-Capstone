@@ -9,20 +9,32 @@
 const char* ssid = "WIFI_NAME";
 const char* password = "WIFI_PASSWORD";
 
-// Backend API
 const char* serverURL = "url";
 
-// NTP Config
+// NTP
 const char* ntpServer = "pool.ntp.org";
-const long gmtOffset_sec = 8 * 3600; // Philippines
+const long gmtOffset_sec = 8 * 3600;
 const int daylightOffset_sec = 0;
 
-// Alarm time (will get the time from the system later)
+// BASE ALARM
 int alarmHour = 7;
 int alarmMinute = 0;
 
+// SYSTEM FLAGS
 bool alarmActive = false;
 bool alarmTriggered = false;
+bool alreadyTaken = false;
+bool isOpen = false;
+
+unsigned long openStartTime = 0;
+
+// SNOOZE SYSTEM
+int snoozeCount = 0;
+int maxSnooze = 2;
+int snoozeInterval = 10; // minutes
+
+int currentAlarmHour;
+int currentAlarmMinute;
 
 void setup() {
   Serial.begin(115200);
@@ -31,81 +43,138 @@ void setup() {
   pinMode(LED, OUTPUT);
   pinMode(BUZZER, OUTPUT);
 
-  // To connect to wiFi
   WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
 
-  Serial.println("\nConnected to WiFi!");
+  Serial.println("\nConnected!");
 
-  // NTP INIT
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  Serial.println("Syncing time...");
   delay(2000);
+
+  // initialize first alarm
+  currentAlarmHour = alarmHour;
+  currentAlarmMinute = alarmMinute;
 }
 
 void loop() {
   struct tm timeinfo;
 
-  if (!getLocalTime(&timeinfo)) {
-    Serial.println("Failed to get time");
-    return;
+  if (!getLocalTime(&timeinfo)) return;
+
+  int h = timeinfo.tm_hour;
+  int m = timeinfo.tm_min;
+  int s = timeinfo.tm_sec;
+
+  Serial.printf("Time: %02d:%02d:%02d\n", h, m, s);
+
+  // TRIGGER ALARM / SNOOZE
+  if (h == currentAlarmHour && m == currentAlarmMinute && !alarmTriggered) {
+    Serial.println("ALARM TRIGGERED");
+    alarmActive = true;
+    alarmTriggered = true;
+    alreadyTaken = false;
   }
 
-  int currentHour = timeinfo.tm_hour;
-  int currentMinute = timeinfo.tm_min;
-  int currentSecond = timeinfo.tm_sec;
-
-  Serial.printf("Time: %02d:%02d:%02d\n", currentHour, currentMinute, currentSecond);
-
-  // Alarm logic
-  if (currentHour == alarmHour && currentMinute == alarmMinute) {
-    if (!alarmTriggered) {
-      Serial.println("ALARM STARTED");
-      alarmActive = true;
-      alarmTriggered = true;
-    }
-  } else {
-    alarmTriggered = false; // reset for next trigger
+  // RESET trigger when minute passes
+  if (m != currentAlarmMinute) {
+    alarmTriggered = false;
   }
 
-  // Alarm
+  // ALARM OUTPUT
   if (alarmActive) {
     digitalWrite(LED, HIGH);
     tone(BUZZER, 1000);
   }
 
-  // Medicine taken (limit switch)
-  if (digitalRead(LIMIT_SWITCH) == LOW && alarmActive) {
-    Serial.println("Medicine Taken!");
+  // LIMIT SWITCH (OPEN = HIGH)
+  if (digitalRead(LIMIT_SWITCH) == HIGH) {
 
-    alarmActive = false;
-    digitalWrite(LED, LOW);
-    noTone(BUZZER);
-
-    // send data to backend
-    if (WiFi.status() == WL_CONNECTED) {
-      HTTPClient http;
-
-      http.begin(serverURL);
-      http.addHeader("Content-Type", "application/json");
-
-      String jsonData = "{\"status\":\"taken\"}";
-
-      int httpResponseCode = http.POST(jsonData);
-
-      Serial.print("Response Code: ");
-      Serial.println(httpResponseCode);
-
-      http.end();
+    if (!isOpen) {
+      isOpen = true;
+      openStartTime = millis();
     }
 
-    delay(3000); // debounce / cooldown
+    // TAKEN (after 3 sec open)
+    if ((millis() - openStartTime > 3000) && alarmActive && !alreadyTaken) {
+      Serial.println("MEDICINE TAKEN");
+
+      alarmActive = false;
+      alreadyTaken = true;
+      snoozeCount = 0;
+
+      digitalWrite(LED, LOW);
+      noTone(BUZZER);
+
+      sendToServer("taken");
+    }
+
+  } else {
+    isOpen = false;
   }
 
-  delay(1000);
+  // MISSED / SNOOZE LOGIC
+  if (alarmActive && !alreadyTaken) {
+
+    // if 1 minute passed after alarm trigger
+    static int lastCheckedMinute = -1;
+
+    if (m != lastCheckedMinute) {
+      lastCheckedMinute = m;
+
+      // if still not taken → process snooze/missed
+      if (snoozeCount < maxSnooze) {
+
+        snoozeCount++;
+
+        Serial.println("SNOOZE TRIGGERED");
+
+        // compute next alarm
+        currentAlarmMinute += snoozeInterval;
+
+        if (currentAlarmMinute >= 60) {
+          currentAlarmMinute -= 60;
+          currentAlarmHour = (currentAlarmHour + 1) % 24;
+        }
+
+        alarmActive = false;
+
+      } else {
+        // MISSED
+        Serial.println("MEDICINE MISSED");
+
+        alarmActive = false;
+        snoozeCount = 0;
+
+        sendToServer("missed");
+
+        // reset to original schedule next day/use
+        currentAlarmHour = alarmHour;
+        currentAlarmMinute = alarmMinute;
+      }
+    }
+  }
+
+  delay(500);
+}
+
+// SEND FUNCTION
+void sendToServer(String status) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+
+    http.begin(serverURL);
+    http.addHeader("Content-Type", "application/json");
+
+    String jsonData = "{\"status\":\"" + status + "\"}";
+
+    int code = http.POST(jsonData);
+
+    Serial.print("Response: ");
+    Serial.println(code);
+
+    http.end();
+  }
 }
