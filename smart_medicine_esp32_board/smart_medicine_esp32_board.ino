@@ -14,6 +14,8 @@ const char* password = "WIFI_PASSWORD";
 const char* serverURL = "url";
 const char* scheduleURL = "url/sched";
 
+const char* deviceID = "box_1";
+
 // NTP
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 8 * 3600;
@@ -28,8 +30,9 @@ struct Alarm {
 
 std::vector<Alarm> alarms;
 
-// ACTIVE ALARM TRACKING
+// ACTIVE TRACKING
 int activeAlarmIndex = -1;
+int lastTriggeredMinute = -1;
 
 // FLAGS
 bool alarmActive = false;
@@ -47,26 +50,21 @@ unsigned long alarmStartMillis = 0;
 unsigned long lastBlink = 0;
 bool ledState = false;
 
-// TIME TRACK
+// TIME
 int lastDay = -1;
 
-// WIFI RECONNECT
+// TIMERS
+unsigned long lastFetch = 0;
+
+// WIFI RECONNECT (NON-BLOCKING)
 void ensureWiFi() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Reconnecting WiFi...");
     WiFi.begin(ssid, password);
-
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 5000) {
-      delay(500);
-      Serial.print(".");
-    }
-
-    Serial.println(WiFi.status() == WL_CONNECTED ? "\nReconnected!" : "\nFailed reconnect");
   }
 }
 
-// FETCH MULTIPLE ALARMS
+// FETCH SCHEDULE
 void fetchSchedule() {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
@@ -80,7 +78,12 @@ void fetchSchedule() {
       Serial.println(payload);
 
       DynamicJsonDocument doc(1024);
-      deserializeJson(doc, payload);
+      DeserializationError error = deserializeJson(doc, payload);
+
+      if (error) {
+        Serial.println("JSON Parse Failed!");
+        return;
+      }
 
       alarms.clear();
 
@@ -93,6 +96,10 @@ void fetchSchedule() {
         alarms.push_back(a);
 
         Serial.printf("Loaded Alarm: %02d:%02d\n", a.hour, a.minute);
+      }
+
+      if (alarms.size() == 0) {
+        Serial.println("No alarms loaded!");
       }
 
     } else {
@@ -111,7 +118,8 @@ void sendToServer(String status, int snooze, String timeStr) {
     http.begin(serverURL);
     http.addHeader("Content-Type", "application/json");
 
-    String jsonData = "{\"status\":\"" + status +
+    String jsonData = "{\"device_id\":\"" + String(deviceID) +
+                      "\",\"status\":\"" + status +
                       "\",\"time\":\"" + timeStr +
                       "\",\"snooze\":" + String(snooze) +
                       ",\"alarmIndex\":" + String(activeAlarmIndex) + "}";
@@ -136,6 +144,7 @@ void setup() {
   pinMode(BUZZER, OUTPUT);
 
   WiFi.begin(ssid, password);
+  Serial.print("Connecting");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
@@ -151,6 +160,12 @@ void setup() {
 
 void loop() {
   ensureWiFi();
+
+  // Refresh schedule every 5 mins
+  if (millis() - lastFetch > 300000) {
+    fetchSchedule();
+    lastFetch = millis();
+  }
 
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return;
@@ -174,15 +189,17 @@ void loop() {
     }
   }
 
-  // CHECK ALL ALARMS
+  // TRIGGER ALARM
   if (!alarmActive) {
     for (int i = 0; i < alarms.size(); i++) {
       if (!alarms[i].done &&
           h == alarms[i].hour &&
-          m == alarms[i].minute) {
+          m == alarms[i].minute &&
+          m != lastTriggeredMinute) {
 
         Serial.println("ALARM #" + String(i) + " START");
 
+        lastTriggeredMinute = m;
         alarmActive = true;
         activeAlarmIndex = i;
 
@@ -222,7 +239,9 @@ void loop() {
       alarmActive = false;
       alreadyTaken = true;
 
-      alarms[activeAlarmIndex].done = true;
+      if (activeAlarmIndex >= 0 && activeAlarmIndex < alarms.size()) {
+        alarms[activeAlarmIndex].done = true;
+      }
 
       digitalWrite(LED, LOW);
       noTone(BUZZER);
@@ -250,7 +269,9 @@ void loop() {
 
       alarmActive = false;
 
-      alarms[activeAlarmIndex].done = true;
+      if (activeAlarmIndex >= 0 && activeAlarmIndex < alarms.size()) {
+        alarms[activeAlarmIndex].done = true;
+      }
 
       digitalWrite(LED, LOW);
       noTone(BUZZER);
@@ -259,5 +280,5 @@ void loop() {
     }
   }
 
-  delay(500);
+  delay(200);
 }
