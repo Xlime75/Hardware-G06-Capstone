@@ -16,7 +16,7 @@ const char* scheduleURL = "http://0.0.0.0:3001/sched";
 
 const char* deviceID = "box_1";
 
-// NTP
+// TIME
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 8 * 3600;
 const int daylightOffset_sec = 0;
@@ -31,27 +31,19 @@ struct Alarm {
 std::vector<Alarm> alarms;
 
 // STATE
+bool alarmActive = false;
+bool buzzerOn = false;
+bool systemArmed = false;
+
 int activeAlarmIndex = -1;
 int lastTriggeredMinute = -1;
 
-bool alarmActive = false;
-bool buzzerOn = false;
-bool alreadyTaken = false;
-bool isOpen = false;
-
-// 🔥 NEW SAFETY FLAGS
-bool systemArmed = false;         // prevents boot buzzer trigger
-unsigned long bootTime = 0;       // stabilization timer
-
+int currentPhase = 0;
 unsigned long buzzerStart = 0;
 unsigned long cycleStart = 0;
-int currentPhase = 0;
 
-int snoozeCount = 0;
-int maxSnooze = 2;
-
-int lastDay = -1;
 unsigned long lastFetch = 0;
+int lastDay = -1;
 
 // ---------------- WIFI ----------------
 void ensureWiFi() {
@@ -68,7 +60,6 @@ void fetchSchedule() {
   http.begin(scheduleURL);
 
   int code = http.GET();
-
   if (code == 200) {
     String payload = http.getString();
 
@@ -91,21 +82,20 @@ void fetchSchedule() {
 }
 
 // ---------------- SERVER ----------------
-void sendToServer(String status, int snooze, String timeStr) {
+void sendToServer(String status, String timeStr) {
   if (WiFi.status() != WL_CONNECTED) return;
 
   HTTPClient http;
   http.begin(serverURL);
   http.addHeader("Content-Type", "application/json");
 
-  String jsonData =
+  String json =
     "{\"device_id\":\"" + String(deviceID) +
     "\",\"status\":\"" + status +
     "\",\"time\":\"" + timeStr +
-    "\",\"snooze\":" + String(snooze) +
-    ",\"alarmIndex\":" + String(activeAlarmIndex) + "}";
+    "\",\"alarmIndex\":" + String(activeAlarmIndex) + "}";
 
-  http.POST(jsonData);
+  http.POST(json);
   http.end();
 }
 
@@ -117,15 +107,10 @@ void setup() {
   pinMode(LED, OUTPUT);
   pinMode(BUZZER, OUTPUT);
 
-  // 🔴 HARD BLOCK: prevent boot buzzer glitch
-  digitalWrite(BUZZER, LOW);
+  digitalWrite(BUZZER, LOW); // 🔒 FORCE OFF at boot
   digitalWrite(LED, LOW);
 
-  bootTime = millis();  // start stabilization timer
-  systemArmed = false;  // system not ready yet
-
   WiFi.begin(ssid, password);
-
   while (WiFi.status() != WL_CONNECTED) {
     delay(300);
   }
@@ -133,6 +118,8 @@ void setup() {
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 
   fetchSchedule();
+
+  systemArmed = true; // safe after boot
 }
 
 // ---------------- LOOP ----------------
@@ -141,26 +128,10 @@ void loop() {
 
   unsigned long now = millis();
 
-  // 🔥 SYSTEM ARM DELAY (CRITICAL FIX)
-  // prevents random boot buzzer activation
-  if (!systemArmed) {
-    if (now - bootTime > 3000) { // 3 seconds safety window
-      systemArmed = true;
-      digitalWrite(BUZZER, LOW);
-    } else {
-      digitalWrite(BUZZER, LOW);
-      return; // block everything until stable
-    }
-  }
-
-  // 🔒 HARD SAFETY LOCK (always OFF unless explicitly ON)
-  if (!alarmActive && !buzzerOn) {
-    digitalWrite(BUZZER, LOW);
-  }
-
-  if (millis() - lastFetch > 300000) {
+  // FETCH SCHEDULE PERIODICALLY
+  if (now - lastFetch > 300000) {
     fetchSchedule();
-    lastFetch = millis();
+    lastFetch = now;
   }
 
   struct tm timeinfo;
@@ -181,7 +152,6 @@ void loop() {
 
   // ---------------- TRIGGER ----------------
   if (!alarmActive && systemArmed) {
-
     for (int i = 0; i < alarms.size(); i++) {
       if (!alarms[i].done &&
           h == alarms[i].hour &&
@@ -194,10 +164,7 @@ void loop() {
         buzzerOn = true;
         buzzerStart = now;
         cycleStart = now;
-
         currentPhase = 0;
-        snoozeCount = 0;
-        alreadyTaken = false;
 
         lastTriggeredMinute = m;
         break;
@@ -205,29 +172,29 @@ void loop() {
     }
   }
 
-  // ---------------- BUZZER PATTERN ----------------
-  if (alarmActive && buzzerOn && systemArmed) {
+  // ---------------- BUZZER (NON-BLOCKING) ----------------
+  if (alarmActive && buzzerOn) {
 
     unsigned long cycle = (now - cycleStart) % 1000;
 
     if (cycle < 300) {
-      digitalWrite(BUZZER, HIGH);
+      digitalWrite(BUZZER, HIGH); // ON
     } else {
-      digitalWrite(BUZZER, LOW);
+      digitalWrite(BUZZER, LOW);  // OFF
     }
 
+    // 1 minute alarm
     if (now - buzzerStart >= 60000) {
       buzzerOn = false;
       digitalWrite(BUZZER, LOW);
     }
   }
 
-  // ---------------- SNOOZE ----------------
-  if (alarmActive && !buzzerOn && systemArmed) {
+  // ---------------- SNOOZE (5 min, max 2 cycles) ----------------
+  if (alarmActive && !buzzerOn) {
 
-    unsigned long waitTime = (currentPhase < 2) ? 300000 : 0;
+    if (now - buzzerStart >= 300000 + 60000) {
 
-    if (now - buzzerStart >= waitTime + 60000) {
       currentPhase++;
 
       if (currentPhase <= 2) {
@@ -244,19 +211,18 @@ void loop() {
           alarms[activeAlarmIndex].done = true;
         }
 
-        sendToServer("missed", currentPhase, String(timeStr));
+        sendToServer("missed", String(timeStr));
       }
     }
   }
 
   // ---------------- LIMIT SWITCH ----------------
   if (digitalRead(LIMIT_SWITCH) == HIGH) {
-    if (!isOpen) isOpen = true;
 
-    if (alarmActive && !alreadyTaken && (now - buzzerStart > 3000)) {
+    if (alarmActive) {
 
       alarmActive = false;
-      alreadyTaken = true;
+      buzzerOn = false;
 
       digitalWrite(BUZZER, LOW);
       digitalWrite(LED, LOW);
@@ -265,15 +231,12 @@ void loop() {
         alarms[activeAlarmIndex].done = true;
       }
 
-      sendToServer("taken", snoozeCount, String(timeStr));
+      sendToServer("taken", String(timeStr));
     }
-
-  } else {
-    isOpen = false;
   }
 
   // ---------------- LED ----------------
   digitalWrite(LED, buzzerOn ? HIGH : LOW);
 
-  delay(200);
+  delay(50);
 }
