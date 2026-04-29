@@ -8,11 +8,10 @@
 #define LED 22
 #define BUZZER 25
 
-const char* ssid = "Xlime";
-const char* password = "Asher1234";
+const char* ssid = "St Dominic College of Asia";
+const char* password = "Edigitalcampus";
 
-const char* serverURL = "http://0.0.0.0:3001";
-const char* scheduleURL = "http://0.0.0.0:3001/sched";
+const char* scheduleURL = "http://192.168.23.165:3000/api/esp32/sched";
 
 const char* deviceID = "box_1";
 
@@ -21,7 +20,7 @@ const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 8 * 3600;
 const int daylightOffset_sec = 0;
 
-// ALARM STRUCT
+// ---------------- ALARM STRUCT ----------------
 struct Alarm {
   int hour;
   int minute;
@@ -30,10 +29,10 @@ struct Alarm {
 
 std::vector<Alarm> alarms;
 
-// STATE
+// ---------------- STATE ----------------
 bool alarmActive = false;
 bool buzzerOn = false;
-bool systemArmed = false;
+bool systemArmed = true;
 
 int activeAlarmIndex = -1;
 int lastTriggeredMinute = -1;
@@ -45,57 +44,98 @@ unsigned long cycleStart = 0;
 unsigned long lastFetch = 0;
 int lastDay = -1;
 
-// ---------------- WIFI ----------------
-void ensureWiFi() {
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.begin(ssid, password);
+// ---------------- BUTTON STATE ----------------
+unsigned long pressStart = 0;
+bool pressing = false;
+bool holdTriggered = false;
+
+// ---------------- SELF TEST ----------------
+void selfTest() {
+  Serial.println("Running self-test...");
+
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED, HIGH);
+    digitalWrite(BUZZER, HIGH);
+    delay(150);
+    digitalWrite(LED, LOW);
+    digitalWrite(BUZZER, LOW);
+    delay(150);
   }
 }
 
-// ---------------- FETCH ----------------
+// ---------------- WIFI ----------------
+void connectWiFi() {
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+
+  Serial.println("\nConnected!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void ensureWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Reconnecting WiFi...");
+    connectWiFi();
+  }
+}
+
+// ---------------- FETCH SCHEDULE ----------------
 void fetchSchedule() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   HTTPClient http;
   http.begin(scheduleURL);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  Serial.println("\nFetching schedule...");
 
   int code = http.GET();
+  Serial.print("HTTP Code: ");
+  Serial.println(code);
+
   if (code == 200) {
     String payload = http.getString();
 
-    DynamicJsonDocument doc(1024);
-    if (!deserializeJson(doc, payload)) {
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, payload);
 
-      alarms.clear();
-
-      for (JsonObject obj : doc.as<JsonArray>()) {
-        Alarm a;
-        a.hour = obj["hour"];
-        a.minute = obj["minute"];
-        a.done = false;
-        alarms.push_back(a);
-      }
+    if (error) {
+      Serial.print("JSON Error: ");
+      Serial.println(error.c_str());
+      http.end();
+      return;
     }
+
+    alarms.clear();
+
+    for (JsonObject obj : doc.as<JsonArray>()) {
+      Alarm a;
+      a.hour = obj["hour"] | 0;
+      a.minute = obj["minute"] | 0;
+      a.done = false;
+
+      alarms.push_back(a);
+
+      Serial.print("Loaded alarm: ");
+      Serial.print(a.hour);
+      Serial.print(":");
+      if (a.minute < 10) Serial.print("0");
+      Serial.println(a.minute);
+    }
+
+    Serial.print("Total alarms: ");
+    Serial.println(alarms.size());
+
+  } else {
+    Serial.println("Failed to fetch schedule.");
   }
 
-  http.end();
-}
-
-// ---------------- SERVER ----------------
-void sendToServer(String status, String timeStr) {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  HTTPClient http;
-  http.begin(serverURL);
-  http.addHeader("Content-Type", "application/json");
-
-  String json =
-    "{\"device_id\":\"" + String(deviceID) +
-    "\",\"status\":\"" + status +
-    "\",\"time\":\"" + timeStr +
-    "\",\"alarmIndex\":" + String(activeAlarmIndex) + "}";
-
-  http.POST(json);
   http.end();
 }
 
@@ -107,19 +147,18 @@ void setup() {
   pinMode(LED, OUTPUT);
   pinMode(BUZZER, OUTPUT);
 
-  digitalWrite(BUZZER, LOW); // 🔒 FORCE OFF at boot
+  digitalWrite(BUZZER, LOW);
   digitalWrite(LED, LOW);
 
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(300);
-  }
+  selfTest();
+  connectWiFi();
 
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 
-  fetchSchedule();
+  Serial.println("Waiting for time sync...");
+  delay(2000);
 
-  systemArmed = true; // safe after boot
+  fetchSchedule();
 }
 
 // ---------------- LOOP ----------------
@@ -128,8 +167,8 @@ void loop() {
 
   unsigned long now = millis();
 
-  // FETCH SCHEDULE PERIODICALLY
-  if (now - lastFetch > 300000) {
+  // refresh schedule
+  if (now - lastFetch > 30000) {
     fetchSchedule();
     lastFetch = now;
   }
@@ -141,10 +180,7 @@ void loop() {
   int m = timeinfo.tm_min;
   int d = timeinfo.tm_mday;
 
-  char timeStr[6];
-  sprintf(timeStr, "%02d:%02d", h, m);
-
-  // DAILY RESET
+  // reset daily
   if (d != lastDay) {
     lastDay = d;
     for (auto &a : alarms) a.done = false;
@@ -155,8 +191,10 @@ void loop() {
     for (int i = 0; i < alarms.size(); i++) {
       if (!alarms[i].done &&
           h == alarms[i].hour &&
-          m == alarms[i].minute &&
+          abs(m - alarms[i].minute) <= 1 &&
           m != lastTriggeredMinute) {
+
+        Serial.println("ALARM TRIGGERED!");
 
         alarmActive = true;
         activeAlarmIndex = i;
@@ -164,7 +202,6 @@ void loop() {
         buzzerOn = true;
         buzzerStart = now;
         cycleStart = now;
-        currentPhase = 0;
 
         lastTriggeredMinute = m;
         break;
@@ -172,70 +209,80 @@ void loop() {
     }
   }
 
-  // ---------------- BUZZER (NON-BLOCKING) ----------------
+  // ---------------- BUZZER ----------------
   if (alarmActive && buzzerOn) {
-
     unsigned long cycle = (now - cycleStart) % 1000;
+    digitalWrite(BUZZER, (cycle < 300) ? HIGH : LOW);
 
-    if (cycle < 300) {
-      digitalWrite(BUZZER, HIGH); // ON
-    } else {
-      digitalWrite(BUZZER, LOW);  // OFF
-    }
-
-    // 1 minute alarm
     if (now - buzzerStart >= 60000) {
       buzzerOn = false;
       digitalWrite(BUZZER, LOW);
     }
   }
 
-  // ---------------- SNOOZE (5 min, max 2 cycles) ----------------
+  // ---------------- SNOOZE ----------------
   if (alarmActive && !buzzerOn) {
-
-    if (now - buzzerStart >= 300000 + 60000) {
+    if (now - buzzerStart >= 300000) {
 
       currentPhase++;
 
       if (currentPhase <= 2) {
+        Serial.println("Snooze triggered");
+
         buzzerOn = true;
         buzzerStart = now;
         cycleStart = now;
+
       } else {
+        Serial.println("Missed medicine");
 
         alarmActive = false;
+        buzzerOn = false;
         digitalWrite(BUZZER, LOW);
         digitalWrite(LED, LOW);
 
-        if (activeAlarmIndex >= 0 && activeAlarmIndex < alarms.size()) {
+        if (activeAlarmIndex >= 0) {
           alarms[activeAlarmIndex].done = true;
         }
-
-        sendToServer("missed", String(timeStr));
       }
     }
   }
 
-  // ---------------- LIMIT SWITCH ----------------
-  if (digitalRead(LIMIT_SWITCH) == HIGH) {
+  // ---------------- BUTTON HOLD (FIXED) ----------------
+  bool buttonState = digitalRead(LIMIT_SWITCH) == LOW;
 
-    if (alarmActive) {
+  if (buttonState) {
+
+    if (!pressing) {
+      pressing = true;
+      pressStart = now;
+      holdTriggered = false;
+    }
+
+    unsigned long holdTime = now - pressStart;
+
+    if (!holdTriggered && holdTime >= 3000) {
+      holdTriggered = true;
+
+      Serial.println("Medicine taken");
 
       alarmActive = false;
       buzzerOn = false;
+      currentPhase = 0;
 
       digitalWrite(BUZZER, LOW);
       digitalWrite(LED, LOW);
 
-      if (activeAlarmIndex >= 0 && activeAlarmIndex < alarms.size()) {
+      if (activeAlarmIndex >= 0) {
         alarms[activeAlarmIndex].done = true;
       }
-
-      sendToServer("taken", String(timeStr));
     }
+
+  } else {
+    pressing = false;
+    holdTriggered = false;
   }
 
-  // ---------------- LED ----------------
   digitalWrite(LED, buzzerOn ? HIGH : LOW);
 
   delay(50);
