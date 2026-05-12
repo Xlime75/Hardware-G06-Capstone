@@ -8,10 +8,10 @@
 #define LED 22
 #define BUZZER 25
 
-const char* ssid = "St Dominic College of Asia";
-const char* password = "Edigitalcampus";
+const char* ssid = "Bading kayo";
+const char* password = "123456789";
 
-const char* scheduleURL = "http://192.168.23.165:3000/api/esp32/sched";
+const char* scheduleURL = "http://10.59.230.75:3000/api/esp32/sched";
 
 const char* deviceID = "box_1";
 
@@ -248,40 +248,40 @@ void loop() {
     }
   }
 
-  // ---------------- BUTTON HOLD (FIXED) ----------------
-  bool buttonState = digitalRead(LIMIT_SWITCH) == LOW;
+  // ---------------- BUTTON RELEASE HOLD ----------------
+bool buttonReleased = digitalRead(LIMIT_SWITCH) == HIGH;
 
-  if (buttonState) {
+if (buttonReleased) {
 
-    if (!pressing) {
-      pressing = true;
-      pressStart = now;
-      holdTriggered = false;
-    }
-
-    unsigned long holdTime = now - pressStart;
-
-    if (!holdTriggered && holdTime >= 3000) {
-      holdTriggered = true;
-
-      Serial.println("Medicine taken");
-
-      alarmActive = false;
-      buzzerOn = false;
-      currentPhase = 0;
-
-      digitalWrite(BUZZER, LOW);
-      digitalWrite(LED, LOW);
-
-      if (activeAlarmIndex >= 0) {
-        alarms[activeAlarmIndex].done = true;
-      }
-    }
-
-  } else {
-    pressing = false;
+  if (!pressing) {
+    pressing = true;
+    pressStart = now;
     holdTriggered = false;
   }
+
+  unsigned long releaseTime = now - pressStart;
+
+  if (!holdTriggered && releaseTime >= 3000) {
+    holdTriggered = true;
+
+    Serial.println("Medicine taken");
+
+    alarmActive = false;
+    buzzerOn = false;
+    currentPhase = 0;
+
+    digitalWrite(BUZZER, LOW);
+    digitalWrite(LED, LOW);
+
+    if (activeAlarmIndex >= 0) {
+      alarms[activeAlarmIndex].done = true;
+    }
+  }
+
+} else {
+  pressing = false;
+  holdTriggered = false;
+}
 
   digitalWrite(LED, buzzerOn ? HIGH : LOW);
 
