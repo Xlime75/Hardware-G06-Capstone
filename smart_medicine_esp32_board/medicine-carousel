@@ -1,0 +1,2106 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "time.h"
+#include <ArduinoJson.h>
+#include <vector>
+#include <ESP32Servo.h>
+
+// ======================================================
+// PIN CONFIGURATION
+// ======================================================
+
+#define LED 22
+#define BUZZER 25
+
+#define CAROUSEL_SERVO 18
+
+#define TRIG_PIN 5
+#define ECHO_PIN 19
+
+// ======================================================
+// WIFI / SERVER
+// ======================================================
+
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+const char* scheduleURL =
+  "http://192.168.1.37:3000/api/esp32/sched";
+
+const char* eventURL =
+  "http://192.168.1.37:3000/api/esp32/event";
+
+const char* sensorApiKey =
+  "dev-sensor-key-change-me";
+
+const char* deviceID = "box_1";
+
+// ======================================================
+// TIME
+// ======================================================
+
+const char* ntpServer = "pool.ntp.org";
+
+const long gmtOffset_sec = 8 * 3600;
+const int daylightOffset_sec = 0;
+
+// ======================================================
+// SERVO / CAROUSEL
+// ======================================================
+
+Servo carouselServo;
+
+// HOME POSITION
+const int HOME_POSITION = 0;
+
+// ------------------------------------------------------
+// CALIBRATED CAROUSEL POSITIONS
+// ------------------------------------------------------
+
+const int chamberPositions[] = {
+  65,    // Chamber 1
+  107,   // Chamber 2
+  152,   // Chamber 3
+  180    // Chamber 4
+};
+
+const int NUMBER_OF_CHAMBERS = 4;
+
+// Time for medicine to fall
+const int DISPENSE_DELAY = 1500;
+
+// Time for servo to settle
+const int SERVO_SETTLE_TIME = 800;
+
+// ------------------------------------------------------
+// CURRENT CAROUSEL POSITION
+//
+// 0 = Chamber 1
+// 1 = Chamber 2
+// 2 = Chamber 3
+// 3 = Chamber 4
+//
+// ------------------------------------------------------
+
+int currentChamberIndex = 0;
+
+// ======================================================
+// ULTRASONIC
+// ======================================================
+
+const float HAND_DISTANCE_CM = 7.0;
+
+// Number of consecutive detections required
+const int REQUIRED_HAND_DETECTIONS = 3;
+
+int handDetectionCount = 0;
+
+// ======================================================
+// ALARM TIMING
+// ======================================================
+
+// Initial alarm buzzer duration
+const unsigned long ALARM_DURATION = 60000;
+
+// Wait 5 minutes before next snooze
+const unsigned long SNOOZE_WAIT = 300000;
+
+// Number of snoozes allowed
+const int MAX_SNOOZES = 2;
+
+// ======================================================
+// ALARM STRUCT
+// ======================================================
+
+struct Alarm {
+  int hour;
+  int minute;
+  bool done;
+};
+
+std::vector<Alarm> alarms;
+
+// ======================================================
+// SYSTEM STATE
+// ======================================================
+
+bool alarmActive = false;
+
+bool buzzerOn = false;
+
+bool systemArmed = true;
+
+// Has medicine already been dispensed
+// for the current alarm?
+bool medicineDispensed = false;
+
+// Is system waiting for user hand?
+bool waitingForHand = false;
+
+// Which alarm is currently active?
+int activeAlarmIndex = -1;
+
+int lastTriggeredMinute = -1;
+
+// 0 = initial alarm
+// 1 = snooze #1
+// 2 = snooze #2
+// 3 = missed
+int currentPhase = 0;
+
+// ======================================================
+// TIMERS
+// ======================================================
+
+// When current buzzer started
+unsigned long buzzerStart = 0;
+
+// When current buzzer cycle started
+unsigned long cycleStart = 0;
+
+// When 5-minute waiting period started
+unsigned long snoozeWaitStart = 0;
+
+// Last schedule fetch
+unsigned long lastFetch = 0;
+
+// When medicine was dispensed
+unsigned long dispenseTime = 0;
+
+// Last ultrasonic check
+unsigned long lastUltrasonicCheck = 0;
+
+int lastDay = -1;
+
+// ======================================================
+// CHECK IF ALL ALARMS ARE DONE
+// ======================================================
+
+bool allAlarmsCompleted() {
+
+  if (alarms.size() == 0) {
+    return false;
+  }
+
+  for (int i = 0; i < alarms.size(); i++) {
+
+    if (!alarms[i].done) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ======================================================
+// MOVE CAROUSEL TO CHAMBER
+// ======================================================
+
+bool moveCarouselToChamber(int chamberIndex) {
+
+  if (
+    chamberIndex < 0 ||
+    chamberIndex >= NUMBER_OF_CHAMBERS
+  ) {
+
+    Serial.println(
+      "ERROR: Invalid chamber index!"
+    );
+
+    return false;
+  }
+
+  int targetAngle =
+    chamberPositions[chamberIndex];
+
+  Serial.println();
+  Serial.println("==============================");
+
+  Serial.print(
+    "Moving carousel to Chamber "
+  );
+
+  Serial.println(
+    chamberIndex + 1
+  );
+
+  Serial.print(
+    "Target angle: "
+  );
+
+  Serial.print(
+    targetAngle
+  );
+
+  Serial.println(
+    " degrees"
+  );
+
+  // Move servo
+  carouselServo.write(
+    targetAngle
+  );
+
+  // Give servo time to move
+  delay(
+    SERVO_SETTLE_TIME
+  );
+
+  Serial.print(
+    "Chamber "
+  );
+
+  Serial.print(
+    chamberIndex + 1
+  );
+
+  Serial.println(
+    " positioned."
+  );
+
+  Serial.println(
+    "=============================="
+  );
+
+  return true;
+}
+
+// ======================================================
+// RETURN CAROUSEL HOME
+// ======================================================
+
+void returnCarouselHome() {
+
+  Serial.println();
+  Serial.println("==============================");
+  Serial.println(
+    "Returning carousel to HOME..."
+  );
+  Serial.println("==============================");
+
+  carouselServo.write(
+    HOME_POSITION
+  );
+
+  delay(
+    SERVO_SETTLE_TIME
+  );
+
+  Serial.println(
+    "Carousel at HOME (0 degrees)."
+  );
+
+  // Next day starts with Chamber 1
+  currentChamberIndex = 0;
+}
+
+// ======================================================
+// ULTRASONIC DISTANCE
+// ======================================================
+
+float getDistanceCM() {
+
+  digitalWrite(
+    TRIG_PIN,
+    LOW
+  );
+
+  delayMicroseconds(2);
+
+  digitalWrite(
+    TRIG_PIN,
+    HIGH
+  );
+
+  delayMicroseconds(10);
+
+  digitalWrite(
+    TRIG_PIN,
+    LOW
+  );
+
+  long duration =
+    pulseIn(
+      ECHO_PIN,
+      HIGH,
+      30000
+    );
+
+  if (duration == 0) {
+
+    return -1;
+  }
+
+  float distance =
+    duration * 0.0343 / 2.0;
+
+  return distance;
+}
+
+// ======================================================
+// HAND DETECTION
+// ======================================================
+
+bool detectHand() {
+
+  float distance =
+    getDistanceCM();
+
+  if (distance < 0) {
+
+    return false;
+  }
+
+  Serial.print(
+    "Ultrasonic distance: "
+  );
+
+  Serial.print(
+    distance
+  );
+
+  Serial.println(
+    " cm"
+  );
+
+  // ----------------------------------------------------
+  // HAND IS CLOSE ENOUGH
+  // ----------------------------------------------------
+
+  if (
+    distance <=
+    HAND_DISTANCE_CM
+  ) {
+
+    handDetectionCount++;
+
+    Serial.print(
+      "Hand detection "
+    );
+
+    Serial.print(
+      handDetectionCount
+    );
+
+    Serial.print(
+      "/"
+    );
+
+    Serial.println(
+      REQUIRED_HAND_DETECTIONS
+    );
+
+    // --------------------------------------------------
+    // REQUIRED NUMBER OF DETECTIONS REACHED
+    // --------------------------------------------------
+
+    if (
+      handDetectionCount >=
+      REQUIRED_HAND_DETECTIONS
+    ) {
+
+      handDetectionCount = 0;
+
+      return true;
+    }
+
+  } else {
+
+    // --------------------------------------------------
+    // HAND MOVED TOO FAR AWAY
+    // --------------------------------------------------
+
+    handDetectionCount = 0;
+  }
+
+  return false;
+}
+
+// ======================================================
+// SELF TEST
+// ======================================================
+
+void selfTest() {
+
+  Serial.println(
+    "Running self-test..."
+  );
+
+  for (
+    int i = 0;
+    i < 3;
+    i++
+  ) {
+
+    digitalWrite(
+      LED,
+      HIGH
+    );
+
+    digitalWrite(
+      BUZZER,
+      HIGH
+    );
+
+    delay(150);
+
+    digitalWrite(
+      LED,
+      LOW
+    );
+
+    digitalWrite(
+      BUZZER,
+      LOW
+    );
+
+    delay(150);
+  }
+
+  Serial.println(
+    "Self-test complete."
+  );
+}
+
+// ======================================================
+// WIFI
+// ======================================================
+
+void connectWiFi() {
+
+  Serial.println(
+    "Connecting to WiFi..."
+  );
+
+  WiFi.begin(
+    ssid,
+    password
+  );
+
+  while (
+    WiFi.status() != WL_CONNECTED
+  ) {
+
+    Serial.print(
+      "."
+    );
+
+    delay(300);
+  }
+
+  Serial.println(
+    "\nConnected!"
+  );
+
+  Serial.print(
+    "IP: "
+  );
+
+  Serial.println(
+    WiFi.localIP()
+  );
+}
+
+// ======================================================
+// WIFI RECONNECT
+// ======================================================
+
+void ensureWiFi() {
+
+  if (
+    WiFi.status() != WL_CONNECTED
+  ) {
+
+    Serial.println(
+      "Reconnecting WiFi..."
+    );
+
+    connectWiFi();
+  }
+}
+
+// ======================================================
+// FORMAT TIME
+// ======================================================
+
+String formatTime(
+  int hour,
+  int minute
+) {
+
+  String hh =
+    hour < 10
+      ? "0" + String(hour)
+      : String(hour);
+
+  String mm =
+    minute < 10
+      ? "0" + String(minute)
+      : String(minute);
+
+  return hh + ":" + mm;
+}
+
+// ======================================================
+// SEND EVENT
+// ======================================================
+
+void sendEvent(
+  const char* status,
+  int hour,
+  int minute,
+  int snooze,
+  int alarmIndex
+) {
+
+  ensureWiFi();
+
+  if (
+    WiFi.status() != WL_CONNECTED
+  ) {
+
+    Serial.println(
+      "Cannot send event."
+    );
+
+    return;
+  }
+
+  DynamicJsonDocument doc(
+    512
+  );
+
+  doc["device_id"] =
+    deviceID;
+
+  doc["status"] =
+    status;
+
+  doc["time"] =
+    formatTime(
+      hour,
+      minute
+    );
+
+  doc["snooze"] =
+    snooze;
+
+  doc["alarmIndex"] =
+    alarmIndex;
+
+  String payload;
+
+  serializeJson(
+    doc,
+    payload
+  );
+
+  Serial.println(
+    "Sending event:"
+  );
+
+  Serial.println(
+    payload
+  );
+
+  HTTPClient http;
+
+  http.begin(
+    eventURL
+  );
+
+  http.addHeader(
+    "Content-Type",
+    "application/json"
+  );
+
+  http.addHeader(
+    "x-sensor-key",
+    sensorApiKey
+  );
+
+  int httpCode =
+    http.POST(
+      payload
+    );
+
+  Serial.print(
+    "Event POST code: "
+  );
+
+  Serial.println(
+    httpCode
+  );
+
+  if (
+    httpCode > 0
+  ) {
+
+    String response =
+      http.getString();
+
+    Serial.print(
+      "Event response: "
+    );
+
+    Serial.println(
+      response
+    );
+
+  } else {
+
+    Serial.print(
+      "Event POST failed: "
+    );
+
+    Serial.println(
+      http.errorToString(
+        httpCode
+      )
+    );
+  }
+
+  http.end();
+}
+
+// ======================================================
+// FETCH SCHEDULE
+// ======================================================
+//
+// IMPORTANT FIX:
+//
+// Previously:
+//
+//     alarms.clear();
+//
+// followed by:
+//
+//     a.done = false;
+//
+// This caused already completed alarms to become
+// incomplete every 30 seconds.
+//
+// This version:
+//
+// 1. Saves the old alarms.
+// 2. Downloads the new schedule.
+// 3. Matches alarms using hour + minute.
+// 4. Preserves the old "done" state.
+// 5. New alarms start as done = false.
+// 6. Does not refresh while an alarm is active.
+//
+// ======================================================
+
+void fetchSchedule() {
+
+  // ----------------------------------------------------
+  // DO NOT REFRESH WHILE AN ALARM IS ACTIVE
+  // ----------------------------------------------------
+  //
+  // This protects activeAlarmIndex and prevents the
+  // alarm list from changing while an alarm is being
+  // processed.
+  //
+
+  if (
+    alarmActive
+  ) {
+
+    Serial.println(
+      "Schedule refresh skipped - alarm is active."
+    );
+
+    return;
+  }
+
+  // ----------------------------------------------------
+  // CHECK WIFI
+  // ----------------------------------------------------
+
+  if (
+    WiFi.status() != WL_CONNECTED
+  ) {
+
+    return;
+  }
+
+  HTTPClient http;
+
+  http.begin(
+    scheduleURL
+  );
+
+  http.setFollowRedirects(
+    HTTPC_STRICT_FOLLOW_REDIRECTS
+  );
+
+  Serial.println(
+    "\nFetching schedule..."
+  );
+
+  int code =
+    http.GET();
+
+  Serial.print(
+    "HTTP Code: "
+  );
+
+  Serial.println(
+    code
+  );
+
+  // ====================================================
+  // SUCCESSFUL RESPONSE
+  // ====================================================
+
+  if (
+    code == 200
+  ) {
+
+    String payload =
+      http.getString();
+
+    Serial.println(
+      "----- SERVER RESPONSE -----"
+    );
+
+    Serial.println(
+      payload
+    );
+
+    Serial.println(
+      "---------------------------"
+    );
+
+    // --------------------------------------------------
+    // PARSE JSON
+    // --------------------------------------------------
+
+    DynamicJsonDocument doc(
+      4096
+    );
+
+    DeserializationError error =
+      deserializeJson(
+        doc,
+        payload
+      );
+
+    if (
+      error
+    ) {
+
+      Serial.print(
+        "JSON Error: "
+      );
+
+      Serial.println(
+        error.c_str()
+      );
+
+      http.end();
+
+      return;
+    }
+
+    // ==================================================
+    // SAVE OLD ALARMS
+    // ==================================================
+    //
+    // We copy the current alarm list before clearing it.
+    //
+    // This allows us to preserve "done" states.
+    //
+
+    std::vector<Alarm> oldAlarms =
+      alarms;
+
+    // ==================================================
+    // CLEAR CURRENT ALARM LIST
+    // ==================================================
+
+    alarms.clear();
+
+    // ==================================================
+    // LOAD NEW ALARMS
+    // ==================================================
+
+    for (
+      JsonObject obj :
+      doc.as<JsonArray>()
+    ) {
+
+      Alarm newAlarm;
+
+      newAlarm.hour =
+        obj["hour"] | 0;
+
+      newAlarm.minute =
+        obj["minute"] | 0;
+
+      // ------------------------------------------------
+      // DEFAULT FOR NEW ALARM
+      // ------------------------------------------------
+
+      newAlarm.done =
+        false;
+
+      // ------------------------------------------------
+      // LOOK FOR SAME ALARM IN OLD LIST
+      // ------------------------------------------------
+
+      for (
+        int j = 0;
+        j < oldAlarms.size();
+        j++
+      ) {
+
+        if (
+          oldAlarms[j].hour ==
+            newAlarm.hour
+          &&
+          oldAlarms[j].minute ==
+            newAlarm.minute
+        ) {
+
+          // --------------------------------------------
+          // SAME ALARM FOUND
+          //
+          // Preserve its previous completion state.
+          // --------------------------------------------
+
+          newAlarm.done =
+            oldAlarms[j].done;
+
+          Serial.print(
+            "Preserved alarm status: "
+          );
+
+          Serial.print(
+            newAlarm.hour
+          );
+
+          Serial.print(
+            ":"
+          );
+
+          if (
+            newAlarm.minute < 10
+          ) {
+
+            Serial.print(
+              "0"
+            );
+          }
+
+          Serial.print(
+            newAlarm.minute
+          );
+
+          Serial.print(
+            " | done = "
+          );
+
+          Serial.println(
+            newAlarm.done
+              ? "true"
+              : "false"
+          );
+
+          break;
+        }
+      }
+
+      // ------------------------------------------------
+      // ADD NEW ALARM
+      // ------------------------------------------------
+
+      alarms.push_back(
+        newAlarm
+      );
+
+      // ------------------------------------------------
+      // DISPLAY LOADED ALARM
+      // ------------------------------------------------
+
+      Serial.print(
+        "Loaded alarm: "
+      );
+
+      Serial.print(
+        newAlarm.hour
+      );
+
+      Serial.print(
+        ":"
+      );
+
+      if (
+        newAlarm.minute < 10
+      ) {
+
+        Serial.print(
+          "0"
+        );
+      }
+
+      Serial.print(
+        newAlarm.minute
+      );
+
+      Serial.print(
+        " | done = "
+      );
+
+      Serial.println(
+        newAlarm.done
+          ? "true"
+          : "false"
+      );
+    }
+
+    // ==================================================
+    // TOTAL ALARMS
+    // ==================================================
+
+    Serial.print(
+      "Total alarms: "
+    );
+
+    Serial.println(
+      alarms.size()
+    );
+
+  } else {
+
+    Serial.println(
+      "Failed to fetch schedule."
+    );
+  }
+
+  http.end();
+}
+
+// ======================================================
+// DISPENSE MEDICINE
+// ======================================================
+
+bool dispenseMedicine(
+  int alarmIndex
+) {
+
+  if (
+    alarmIndex < 0
+  ) {
+
+    return false;
+  }
+
+  // ----------------------------------------------------
+  // CAROUSEL LOGIC
+  //
+  // Alarm 1 → Chamber 1
+  // Alarm 2 → Chamber 2
+  // Alarm 3 → Chamber 3
+  // Alarm 4 → Chamber 4
+  //
+  // Carousel stays at the current chamber.
+  // ----------------------------------------------------
+
+  if (
+    currentChamberIndex >=
+    NUMBER_OF_CHAMBERS
+  ) {
+
+    Serial.println();
+
+    Serial.println(
+      "ERROR: All 4 chambers have already been used."
+    );
+
+    return false;
+  }
+
+  int chamber =
+    currentChamberIndex;
+
+  Serial.println();
+
+  Serial.println(
+    "=============================="
+  );
+
+  Serial.println(
+    "DISPENSING MEDICINE"
+  );
+
+  Serial.print(
+    "Alarm Index: "
+  );
+
+  Serial.println(
+    alarmIndex
+  );
+
+  Serial.print(
+    "Chamber: "
+  );
+
+  Serial.println(
+    chamber + 1
+  );
+
+  Serial.print(
+    "Servo Angle: "
+  );
+
+  Serial.print(
+    chamberPositions[chamber]
+  );
+
+  Serial.println(
+    " degrees"
+  );
+
+  Serial.println(
+    "=============================="
+  );
+
+  // ----------------------------------------------------
+  // MOVE TO CHAMBER
+  // ----------------------------------------------------
+
+  if (
+    !moveCarouselToChamber(
+      chamber
+    )
+  ) {
+
+    return false;
+  }
+
+  // ----------------------------------------------------
+  // WAIT FOR MEDICINE TO FALL
+  // ----------------------------------------------------
+
+  Serial.println(
+    "Waiting for medicine to dispense..."
+  );
+
+  delay(
+    DISPENSE_DELAY
+  );
+
+  Serial.println(
+    "Medicine should now be dispensed."
+  );
+
+  // ----------------------------------------------------
+  // MARK AS DISPENSED
+  // ----------------------------------------------------
+
+  medicineDispensed =
+    true;
+
+  waitingForHand =
+    true;
+
+  dispenseTime =
+    millis();
+
+  handDetectionCount =
+    0;
+
+  // ----------------------------------------------------
+  // PREPARE NEXT CHAMBER
+  // ----------------------------------------------------
+
+  currentChamberIndex++;
+
+  if (
+    currentChamberIndex <
+    NUMBER_OF_CHAMBERS
+  ) {
+
+    Serial.print(
+      "Next alarm will use Chamber "
+    );
+
+    Serial.println(
+      currentChamberIndex + 1
+    );
+
+  } else {
+
+    Serial.println(
+      "All 4 chambers have been used."
+    );
+  }
+
+  // ----------------------------------------------------
+  // DO NOT RETURN HOME
+  // ----------------------------------------------------
+
+  Serial.println(
+    "Carousel will remain at current chamber."
+  );
+
+  return true;
+}
+
+// ======================================================
+// RESET ALARM
+// ======================================================
+
+void resetAlarmState() {
+
+  alarmActive =
+    false;
+
+  buzzerOn =
+    false;
+
+  medicineDispensed =
+    false;
+
+  waitingForHand =
+    false;
+
+  currentPhase =
+    0;
+
+  activeAlarmIndex =
+    -1;
+
+  buzzerStart =
+    0;
+
+  cycleStart =
+    0;
+
+  snoozeWaitStart =
+    0;
+
+  handDetectionCount =
+    0;
+
+  digitalWrite(
+    BUZZER,
+    LOW
+  );
+
+  digitalWrite(
+    LED,
+    LOW
+  );
+
+  Serial.println(
+    "Alarm fully reset."
+  );
+}
+
+// ======================================================
+// START BUZZER
+// ======================================================
+
+void startBuzzer() {
+
+  buzzerOn =
+    true;
+
+  buzzerStart =
+    millis();
+
+  cycleStart =
+    millis();
+
+  Serial.println();
+
+  Serial.println(
+    "=============================="
+  );
+
+  if (
+    currentPhase == 0
+  ) {
+
+    Serial.println(
+      "INITIAL ALARM"
+    );
+
+  } else {
+
+    Serial.print(
+      "SNOOZE #"
+    );
+
+    Serial.println(
+      currentPhase
+    );
+  }
+
+  Serial.println(
+    "Buzzer ON for 1 minute."
+  );
+
+  Serial.println(
+    "=============================="
+  );
+}
+
+// ======================================================
+// START SNOOZE WAIT
+// ======================================================
+
+void startSnoozeWait() {
+
+  buzzerOn =
+    false;
+
+  digitalWrite(
+    BUZZER,
+    LOW
+  );
+
+  digitalWrite(
+    LED,
+    LOW
+  );
+
+  snoozeWaitStart =
+    millis();
+
+  Serial.println();
+
+  Serial.println(
+    "=============================="
+  );
+
+  Serial.println(
+    "NO HAND DETECTED"
+  );
+
+  Serial.println(
+    "Starting 5-minute wait..."
+  );
+
+  Serial.println(
+    "=============================="
+  );
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup() {
+
+  Serial.begin(
+    115200
+  );
+
+  // ====================================================
+  // PINS
+  // ====================================================
+
+  pinMode(
+    LED,
+    OUTPUT
+  );
+
+  pinMode(
+    BUZZER,
+    OUTPUT
+  );
+
+  pinMode(
+    TRIG_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    ECHO_PIN,
+    INPUT
+  );
+
+  digitalWrite(
+    BUZZER,
+    LOW
+  );
+
+  digitalWrite(
+    LED,
+    LOW
+  );
+
+  // ====================================================
+  // SERVO
+  // ====================================================
+
+  carouselServo.setPeriodHertz(
+    50
+  );
+
+  carouselServo.attach(
+    CAROUSEL_SERVO,
+    500,
+    2400
+  );
+
+  // ====================================================
+  // START AT HOME
+  // ====================================================
+
+  Serial.println(
+    "Moving carousel to HOME..."
+  );
+
+  carouselServo.write(
+    HOME_POSITION
+  );
+
+  delay(
+    1000
+  );
+
+  Serial.println(
+    "Carousel HOME = 0 degrees"
+  );
+
+  currentChamberIndex =
+    0;
+
+  // ====================================================
+  // SELF TEST
+  // ====================================================
+
+  selfTest();
+
+  // ====================================================
+  // WIFI
+  // ====================================================
+
+  connectWiFi();
+
+  // ====================================================
+  // TIME
+  // ====================================================
+
+  configTime(
+    gmtOffset_sec,
+    daylightOffset_sec,
+    ntpServer
+  );
+
+  Serial.println(
+    "Waiting for time sync..."
+  );
+
+  delay(
+    2000
+  );
+
+  // ====================================================
+  // FETCH SCHEDULE
+  // ====================================================
+
+  fetchSchedule();
+
+  Serial.println();
+
+  Serial.println(
+    "=============================="
+  );
+
+  Serial.println(
+    "RX BOX READY"
+  );
+
+  Serial.println(
+    "Carousel HOME = 0 degrees"
+  );
+
+  Serial.println(
+    "=============================="
+  );
+}
+
+// ======================================================
+// LOOP
+// ======================================================
+
+void loop() {
+
+  // ====================================================
+  // WIFI
+  // ====================================================
+
+  ensureWiFi();
+
+  unsigned long now =
+    millis();
+
+  // ====================================================
+  // REFRESH SCHEDULE
+  // ====================================================
+  //
+  // Every 30 seconds.
+  //
+  // fetchSchedule() itself prevents refreshing while
+  // an alarm is active.
+  //
+  // ====================================================
+
+  if (
+    now - lastFetch >
+    30000
+  ) {
+
+    fetchSchedule();
+
+    lastFetch =
+      now;
+  }
+
+  // ====================================================
+  // GET CURRENT TIME
+  // ====================================================
+
+  struct tm timeinfo;
+
+  if (
+    !getLocalTime(
+      &timeinfo
+    )
+  ) {
+
+    return;
+  }
+
+  int h =
+    timeinfo.tm_hour;
+
+  int m =
+    timeinfo.tm_min;
+
+  int d =
+    timeinfo.tm_mday;
+
+  // ====================================================
+  // DAILY RESET
+  // ====================================================
+
+  if (
+    d != lastDay
+  ) {
+
+    Serial.println();
+
+    Serial.println(
+      "=============================="
+    );
+
+    Serial.println(
+      "NEW DAY"
+    );
+
+    Serial.println(
+      "Resetting alarms and carousel."
+    );
+
+    Serial.println(
+      "=============================="
+    );
+
+    lastDay =
+      d;
+
+    lastTriggeredMinute =
+      -1;
+
+    // --------------------------------------------------
+    // START NEW DAY WITH CHAMBER 1
+    // --------------------------------------------------
+
+    currentChamberIndex =
+      0;
+
+    // --------------------------------------------------
+    // RETURN CAROUSEL HOME
+    // --------------------------------------------------
+
+    returnCarouselHome();
+
+    // --------------------------------------------------
+    // RESET ALL ALARMS FOR NEW DAY
+    // --------------------------------------------------
+
+    for (
+      auto &a :
+      alarms
+    ) {
+
+      a.done =
+        false;
+    }
+  }
+
+  // ====================================================
+  // TRIGGER ALARM
+  // ====================================================
+
+  if (
+    !alarmActive &&
+    systemArmed
+  ) {
+
+    for (
+      int i = 0;
+      i < alarms.size();
+      i++
+    ) {
+
+      // ------------------------------------------------
+      // CHECK IF THIS ALARM SHOULD TRIGGER
+      // ------------------------------------------------
+
+      if (
+        !alarms[i].done &&
+        h == alarms[i].hour &&
+        abs(
+          m -
+          alarms[i].minute
+        ) <= 1 &&
+        m != lastTriggeredMinute
+      ) {
+
+        Serial.println();
+
+        Serial.println(
+          "=============================="
+        );
+
+        Serial.println(
+          "ALARM TRIGGERED!"
+        );
+
+        Serial.print(
+          "Alarm #: "
+        );
+
+        Serial.println(
+          i
+        );
+
+        Serial.print(
+          "Scheduled Time: "
+        );
+
+        Serial.println(
+          formatTime(
+            alarms[i].hour,
+            alarms[i].minute
+          )
+        );
+
+        Serial.print(
+          "Current Chamber: "
+        );
+
+        if (
+          currentChamberIndex <
+          NUMBER_OF_CHAMBERS
+        ) {
+
+          Serial.println(
+            currentChamberIndex + 1
+          );
+
+        } else {
+
+          Serial.println(
+            "NONE - ALL CHAMBERS USED"
+          );
+        }
+
+        Serial.println(
+          "=============================="
+        );
+
+        // ------------------------------------------------
+        // ACTIVATE ALARM
+        // ------------------------------------------------
+
+        alarmActive =
+          true;
+
+        activeAlarmIndex =
+          i;
+
+        currentPhase =
+          0;
+
+        lastTriggeredMinute =
+          m;
+
+        // ------------------------------------------------
+        // DISPENSE MEDICINE
+        // ------------------------------------------------
+
+        bool dispensed =
+          dispenseMedicine(
+            activeAlarmIndex
+          );
+
+        // ------------------------------------------------
+        // IF DISPENSING FAILED
+        // ------------------------------------------------
+
+        if (
+          !dispensed
+        ) {
+
+          Serial.println(
+            "ERROR: Medicine could not be dispensed."
+          );
+
+          resetAlarmState();
+
+          break;
+        }
+
+        // ------------------------------------------------
+        // START INITIAL ALARM
+        // ------------------------------------------------
+
+        startBuzzer();
+
+        break;
+      }
+    }
+  }
+
+  // ====================================================
+  // BUZZER
+  // ====================================================
+
+  if (
+    alarmActive &&
+    buzzerOn
+  ) {
+
+    unsigned long cycle =
+      (
+        now -
+        cycleStart
+      ) % 1000;
+
+    // --------------------------------------------------
+    // BUZZER PULSE
+    //
+    // 300ms ON
+    // 700ms OFF
+    // --------------------------------------------------
+
+    digitalWrite(
+      BUZZER,
+      (
+        cycle < 300
+      )
+        ? HIGH
+        : LOW
+    );
+
+    // --------------------------------------------------
+    // STOP AFTER 1 MINUTE
+    // --------------------------------------------------
+
+    if (
+      now -
+      buzzerStart >=
+      ALARM_DURATION
+    ) {
+
+      Serial.println();
+
+      Serial.println(
+        "1-minute alarm finished."
+      );
+
+      // ------------------------------------------------
+      // START 5-MINUTE WAIT
+      // ------------------------------------------------
+
+      startSnoozeWait();
+    }
+  }
+
+  // ====================================================
+  // ULTRASONIC HAND DETECTION
+  // ====================================================
+  //
+  // The sensor continues checking while:
+  //
+  // - Alarm is active
+  // - Medicine has been dispensed
+  // - System is waiting for hand
+  //
+  // This means the user can take the medicine:
+  //
+  // INITIAL ALARM
+  // OR
+  // SNOOZE #1
+  // OR
+  // SNOOZE #2
+  //
+  // ====================================================
+
+  if (
+    alarmActive &&
+    medicineDispensed &&
+    waitingForHand
+  ) {
+
+    // --------------------------------------------------
+    // WAIT 1.5 SECONDS AFTER DISPENSING
+    // --------------------------------------------------
+    //
+    // Prevents the dispensing process itself from
+    // immediately triggering the ultrasonic sensor.
+    //
+
+    if (
+      now -
+      dispenseTime >=
+      1500
+    ) {
+
+      // ------------------------------------------------
+      // CHECK EVERY 100ms
+      // ------------------------------------------------
+
+      if (
+        now -
+        lastUltrasonicCheck >=
+        100
+      ) {
+
+        lastUltrasonicCheck =
+          now;
+
+        // ----------------------------------------------
+        // CHECK HAND
+        // ----------------------------------------------
+
+        if (
+          detectHand()
+        ) {
+
+          Serial.println();
+
+          Serial.println(
+            "=============================="
+          );
+
+          Serial.println(
+            "HAND DETECTED!"
+          );
+
+          Serial.println(
+            "MEDICINE TAKEN"
+          );
+
+          Serial.print(
+            "Completed during Phase: "
+          );
+
+          Serial.println(
+            currentPhase
+          );
+
+          Serial.println(
+            "=============================="
+          );
+
+          // --------------------------------------------
+          // MARK ALARM AS COMPLETED
+          // --------------------------------------------
+
+          if (
+            activeAlarmIndex >= 0 &&
+            activeAlarmIndex <
+              alarms.size()
+          ) {
+
+            alarms[
+              activeAlarmIndex
+            ].done =
+              true;
+
+            // ------------------------------------------
+            // SEND TAKEN EVENT
+            // ------------------------------------------
+
+            sendEvent(
+              "taken",
+              h,
+              m,
+              currentPhase,
+              activeAlarmIndex
+            );
+          }
+
+          // --------------------------------------------
+          // CHECK IF ALL ALARMS ARE FINISHED
+          // --------------------------------------------
+
+          if (
+            allAlarmsCompleted()
+          ) {
+
+            Serial.println();
+
+            Serial.println(
+              "=============================="
+            );
+
+            Serial.println(
+              "ALL MEDICATIONS COMPLETED!"
+            );
+
+            Serial.println(
+              "Returning carousel HOME."
+            );
+
+            Serial.println(
+              "=============================="
+            );
+
+            returnCarouselHome();
+          }
+
+          // --------------------------------------------
+          // RESET CURRENT ALARM
+          // --------------------------------------------
+
+          resetAlarmState();
+        }
+      }
+    }
+  }
+
+  // ====================================================
+  // SNOOZE / MISSED LOGIC
+  // ====================================================
+  //
+  // Phase:
+  //
+  // 0 = Initial alarm
+  // 1 = Snooze #1
+  // 2 = Snooze #2
+  // 3 = Missed
+  //
+  // Flow:
+  //
+  // Initial alarm
+  //      ↓
+  // 1 minute buzzer
+  //      ↓
+  // No hand
+  //      ↓
+  // Wait 5 minutes
+  //      ↓
+  // Snooze #1
+  //      ↓
+  // 1 minute buzzer
+  //      ↓
+  // No hand
+  //      ↓
+  // Wait 5 minutes
+  //      ↓
+  // Snooze #2
+  //      ↓
+  // 1 minute buzzer
+  //      ↓
+  // No hand
+  //      ↓
+  // MISSED
+  //
+  // ====================================================
+
+  if (
+    alarmActive &&
+    medicineDispensed &&
+    waitingForHand &&
+    !buzzerOn
+  ) {
+
+    // --------------------------------------------------
+    // WAIT 5 MINUTES
+    // --------------------------------------------------
+
+    if (
+      now -
+      snoozeWaitStart >=
+      SNOOZE_WAIT
+    ) {
+
+      // ------------------------------------------------
+      // MOVE TO NEXT PHASE
+      // ------------------------------------------------
+
+      currentPhase++;
+
+      // ------------------------------------------------
+      // SNOOZE #1 OR SNOOZE #2
+      // ------------------------------------------------
+
+      if (
+        currentPhase <=
+        MAX_SNOOZES
+      ) {
+
+        Serial.println();
+
+        Serial.println(
+          "=============================="
+        );
+
+        Serial.print(
+          "SNOOZE #"
+        );
+
+        Serial.println(
+          currentPhase
+        );
+
+        Serial.println(
+          "No hand detected."
+        );
+
+        Serial.println(
+          "Buzzer will sound again."
+        );
+
+        Serial.println(
+          "=============================="
+        );
+
+        // ----------------------------------------------
+        // START NEXT BUZZER
+        // ----------------------------------------------
+
+        startBuzzer();
+      }
+
+      // ------------------------------------------------
+      // MISSED
+      // ------------------------------------------------
+
+      else {
+
+        Serial.println();
+
+        Serial.println(
+          "=============================="
+        );
+
+        Serial.println(
+          "MEDICINE MISSED!"
+        );
+
+        Serial.println(
+          "No hand detected after all snoozes."
+        );
+
+        Serial.println(
+          "=============================="
+        );
+
+        // ----------------------------------------------
+        // MARK ALARM AS MISSED
+        // ----------------------------------------------
+
+        if (
+          activeAlarmIndex >= 0 &&
+          activeAlarmIndex <
+            alarms.size()
+        ) {
+
+          alarms[
+            activeAlarmIndex
+          ].done =
+            true;
+
+          // --------------------------------------------
+          // SEND MISSED EVENT
+          // --------------------------------------------
+
+          sendEvent(
+            "missed",
+            h,
+            m,
+            currentPhase,
+            activeAlarmIndex
+          );
+        }
+
+        // ----------------------------------------------
+        // CHECK IF ALL ALARMS ARE FINISHED
+        // ----------------------------------------------
+
+        if (
+          allAlarmsCompleted()
+        ) {
+
+          Serial.println();
+
+          Serial.println(
+            "=============================="
+          );
+
+          Serial.println(
+            "ALL ALARMS FINISHED."
+          );
+
+          Serial.println(
+            "Returning carousel HOME."
+          );
+
+          Serial.println(
+            "=============================="
+          );
+
+          returnCarouselHome();
+        }
+
+        // ----------------------------------------------
+        // RESET CURRENT ALARM
+        // ----------------------------------------------
+
+        resetAlarmState();
+      }
+    }
+  }
+
+  // ====================================================
+  // LED
+  // ====================================================
+  //
+  // LED follows the buzzer:
+  //
+  // Buzzer ON  → LED ON
+  // Buzzer OFF → LED OFF
+  //
+  // ====================================================
+
+  digitalWrite(
+    LED,
+    buzzerOn
+      ? HIGH
+      : LOW
+  );
+
+  // Small loop delay
+  delay(50);
+}
