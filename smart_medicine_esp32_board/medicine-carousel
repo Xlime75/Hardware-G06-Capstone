@@ -1,13 +1,19 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include "time.h"
+#include <time.h>
 #include <ArduinoJson.h>
 #include <vector>
+#include <algorithm>
 #include <ESP32Servo.h>
+#include <esp_timer.h>
+#include <driver/gpio.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
-// ======================================================
-// PIN CONFIGURATION
-// ======================================================
+// ------------------------------------------------------
+// CONFIGURATION
+// ------------------------------------------------------
 
 #define LED 22
 #define BUZZER 25
@@ -15,536 +21,403 @@
 #define TRIG_PIN 5
 #define ECHO_PIN 19
 
-#define BUZZER_TONE_HZ 2000
+const char* ssid = "JC's Iphone 16 Pro Max";
+const char* password = "123456789";
+const char* sensorApiKey = "53915057352185cee50fe0514d87f253999fc447f9473b718184955dfbe48711";
+const char* deviceID = "box_1";
 
-// ======================================================
-// WIFI / LOCAL SERVER
-// ======================================================
-
-const char* ssid =
-  "JC's Iphone 16 Pro Max";
-
-const char* password =
-  "123456789";
-
-/*
- * Use your computer's current IPv4 address.
- * Never use localhost here because localhost on the ESP32
- * refers to the ESP32 itself.
- */
 const char* scheduleURL =
   "https://med-reminder-web-app.vercel.app/api/esp32/sched";
 
 const char* eventURL =
   "https://med-reminder-web-app.vercel.app/api/esp32/event";
 
-/*
- * Must exactly match SENSOR_API_KEY in .env.local.
- */
-const char* sensorApiKey =
-  "53915057352185cee50fe0514d87f253999fc447f9473b718184955dfbe48711";
+const char* ntpServer = "pool.ntp.org";
+const long GMT_OFFSET_SECONDS = 8 * 3600;
+const int DAYLIGHT_OFFSET_SECONDS = 0;
+const time_t MIN_VALID_TIME = 1704067200LL;
 
-/*
- * Must exactly match RX_BOX_DEVICE_ID in .env.local.
- */
-const char* deviceID =
-  "box_1";
+const unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
+const unsigned long HTTP_CONNECT_TIMEOUT_MS = 5000;
+const unsigned long HTTP_READ_TIMEOUT_MS = 20000;
+const unsigned long EVENT_RETRY_INTERVAL_MS = 5000;
+const unsigned long SCHEDULE_FETCH_INTERVAL_MS = 30000;
 
-const unsigned long WIFI_CONNECT_TIMEOUT_MS =
-  20000;
+const size_t MAX_PENDING_EVENTS = 16;
 
-const unsigned long HTTP_CONNECT_TIMEOUT_MS =
-  5000;
+const int HOME_POSITION = 0;
+const int CHAMBER_POSITIONS[] = {65, 107, 152, 180};
+const int NUMBER_OF_CHAMBERS = 4;
 
-const unsigned long HTTP_READ_TIMEOUT_MS =
-  20000;
+const unsigned long SERVO_SETTLE_TIME_MS = 800;
+const unsigned long DISPENSE_DELAY_MS = 1500;
 
-const unsigned long WIFI_RETRY_INTERVAL_MS =
-  10000;
+const float MIN_HAND_DISTANCE_CM = 2.0;
+const float MAX_HAND_DISTANCE_CM = 7.0;
 
-unsigned long lastWiFiAttempt =
-  0;
+const unsigned long SENSOR_SETTLE_MS = 700;
+const unsigned long SENSOR_CHECK_INTERVAL_MS = 100;
+const unsigned long SENSOR_ECHO_TIMEOUT_US = 10000;
 
-// ======================================================
-// BACKEND EVENT RETRY
-// ======================================================
+const unsigned long ALARM_DURATION_MS = 60000;
+const unsigned long SNOOZE_WAIT_MS = 300000;
+const int MAX_SNOOZES = 2;
+const int MAX_LATE_TRIGGER_MINUTES = 60;
 
-const unsigned long EVENT_RETRY_INTERVAL_MS =
-  5000;
+// A 250 us half-period produces an approximately 2000 Hz tone.
+const uint64_t BUZZER_HALF_PERIOD_US = 250;
 
-const int MAX_PENDING_EVENTS =
-  10;
-
-// ======================================================
-// TIME
-// ======================================================
-
-const char* ntpServer =
-  "pool.ntp.org";
-
-/*
- * Asia/Manila = UTC+8.
- * The Philippines does not use daylight saving time.
- */
-const long gmtOffset_sec =
-  8 * 3600;
-
-const int daylightOffset_sec =
-  0;
-
-// ======================================================
-// SERVO / CAROUSEL
-// ======================================================
-
-Servo carouselServo;
-
-const int HOME_POSITION =
-  0;
-
-const int chamberPositions[] = {
-  65,   // Chamber 1
-  107,  // Chamber 2
-  152,  // Chamber 3
-  180   // Chamber 4
-};
-
-const int NUMBER_OF_CHAMBERS =
-  4;
-
-const int DISPENSE_DELAY_MS =
-  1500;
-
-const int SERVO_SETTLE_TIME_MS =
-  800;
-
-int currentChamberIndex =
-  0;
-
-// ======================================================
-// ULTRASONIC SENSOR
-// ======================================================
-
-/*
- * HC-SR04 is generally unreliable below approximately 2 cm.
- */
-const float MIN_HAND_DISTANCE_CM =
-  2.0;
-
-const float MAX_HAND_DISTANCE_CM =
-  7.0;
-
-/*
- * Check the sensor every 100 milliseconds.
- */
-const unsigned long ULTRASONIC_CHECK_INTERVAL_MS =
-  100;
-
-unsigned long lastUltrasonicCheck =
-  0;
-
-// ======================================================
-// ALARM TIMING
-// ======================================================
-
-/*
- * Initial alarm and each snooze alarm sound for one minute.
- */
-const unsigned long ALARM_DURATION_MS =
-  60000;
-
-/*
- * Wait five minutes before sounding the next snooze.
- */
-const unsigned long SNOOZE_WAIT_MS =
-  300000;
-
-const int MAX_SNOOZES =
-  2;
-
-/*
- * Allows an overdue pending group to start after another alarm
- * completes. This helps when schedules are close together.
- */
-const int MAX_LATE_TRIGGER_MINUTES =
-  60;
-
-// ======================================================
-// SCHEDULE FETCH TIMING
-// ======================================================
-
-const unsigned long SCHEDULE_FETCH_INTERVAL_MS =
-  30000;
-
-unsigned long lastFetch =
-  0;
-
-// ======================================================
-// ALARM GROUP
-// ======================================================
+// ------------------------------------------------------
+// DATA
+// ------------------------------------------------------
 
 struct AlarmGroup {
   String groupId;
-  int hour;
-  int minute;
+  int hour = 0;
+  int minute = 0;
   String scheduledTime;
   std::vector<int> chamberIds;
   String status;
-  bool localDone;
+  bool localDone = false;
+  bool started = false;
 };
-
-std::vector<AlarmGroup> alarms;
-
-String currentPlanId =
-  "";
-
-// ======================================================
-// PENDING BACKEND EVENT
-// ======================================================
 
 struct PendingRxBoxEvent {
   String status;
   AlarmGroup group;
-  int snoozeCount;
-  unsigned long lastAttempt;
+  String planId;
+  int snoozeCount = 0;
+  time_t dispensedAt = 0;
+  unsigned long lastAttempt = 0;
+  bool attempted = false;
 };
 
+// Explicit declarations for Arduino sketch preprocessing.
+String createEventId(
+  const String& status,
+  const AlarmGroup& group
+);
+
+bool queueEvent(
+  const char* status,
+  const AlarmGroup& group,
+  int snoozeCount,
+  time_t dispensedAt
+);
+
+bool postEvent(const PendingRxBoxEvent& event);
+bool validateGroup(const AlarmGroup& group);
+bool dispenseGroup(const AlarmGroup& group, time_t& dispensedAt);
+
+Servo carouselServo;
+
+SemaphoreHandle_t stateMutex = nullptr;
+TaskHandle_t networkTaskHandle = nullptr;
+
+std::vector<AlarmGroup> alarms;
 std::vector<PendingRxBoxEvent> pendingEvents;
 
-// ======================================================
-// SYSTEM STATE
-// ======================================================
+String currentPlanId;
+String currentPlanDate;
 
-bool alarmActive =
-  false;
+bool systemArmed = false;
+bool hardwareFault = false;
 
-bool buzzerOn =
-  false;
+bool alarmActive = false;
+bool buzzerOn = false;
+bool waitingForHand = false;
 
-/*
- * Tracks whether the physical buzzer output is currently active.
- * This is separate from the logical alarm state.
- */
-bool buzzerOutputActive =
-  false;
+int activeAlarmIndex = -1;
+int currentPhase = 0;
 
-bool systemArmed =
-  true;
+unsigned long buzzerStartedAt = 0;
+unsigned long snoozeStartedAt = 0;
+unsigned long pickupEnabledAt = 0;
+unsigned long lastSensorCheck = 0;
 
-bool medicineDispensed =
-  false;
+esp_timer_handle_t buzzerTimer = nullptr;
 
-bool waitingForHand =
-  false;
+portMUX_TYPE buzzerMux = portMUX_INITIALIZER_UNLOCKED;
+bool buzzerEnabled = false;
+bool buzzerLevel = false;
 
-int activeAlarmIndex =
-  -1;
+// ------------------------------------------------------
+// BUZZER
+// ------------------------------------------------------
 
-/*
- * Phase 0 = initial alarm
- * Phase 1 = snooze 1
- * Phase 2 = snooze 2
- * Phase 3 = missed
- */
-int currentPhase =
-  0;
+void buzzerTimerCallback(void*) {
+  portENTER_CRITICAL(&buzzerMux);
 
-unsigned long buzzerStart =
-  0;
-
-unsigned long buzzerCycleStart =
-  0;
-
-unsigned long snoozeWaitStart =
-  0;
-
-int lastDay =
-  -1;
-
-// ======================================================
-// BUZZER HELPERS
-// ======================================================
-
-void buzzerOnSound() {
-  if (buzzerOutputActive) {
-    return;
+  if (buzzerEnabled) {
+    buzzerLevel = !buzzerLevel;
+    gpio_set_level(
+      static_cast<gpio_num_t>(BUZZER),
+      buzzerLevel ? 1 : 0
+    );
   }
 
-  tone(
-    BUZZER,
-    BUZZER_TONE_HZ
-  );
-
-  buzzerOutputActive =
-    true;
+  portEXIT_CRITICAL(&buzzerMux);
 }
 
 void buzzerOffSound() {
-  if (buzzerOutputActive) {
-    noTone(
-      BUZZER
-    );
+  portENTER_CRITICAL(&buzzerMux);
+  buzzerEnabled = false;
+  buzzerLevel = false;
+  gpio_set_level(static_cast<gpio_num_t>(BUZZER), 0);
+  portEXIT_CRITICAL(&buzzerMux);
 
-    buzzerOutputActive =
-      false;
+  if (buzzerTimer != nullptr) {
+    esp_timer_stop(buzzerTimer);
+  }
+}
+
+void buzzerOnSound() {
+  if (buzzerTimer == nullptr) {
+    return;
   }
 
-  /*
-   * Always force the pin LOW as a physical failsafe.
-   */
-  digitalWrite(
-    BUZZER,
-    LOW
+  portENTER_CRITICAL(&buzzerMux);
+  const bool alreadyEnabled = buzzerEnabled;
+  portEXIT_CRITICAL(&buzzerMux);
+
+  if (alreadyEnabled) {
+    return;
+  }
+
+  const esp_err_t result = esp_timer_start_periodic(
+    buzzerTimer,
+    BUZZER_HALF_PERIOD_US
   );
+
+  if (result != ESP_OK) {
+    Serial.print("ERROR: Buzzer timer start failed: ");
+    Serial.println(static_cast<int>(result));
+    return;
+  }
+
+  portENTER_CRITICAL(&buzzerMux);
+  buzzerLevel = false;
+  buzzerEnabled = true;
+  portEXIT_CRITICAL(&buzzerMux);
 }
 
-// ======================================================
-// WIFI STATUS TEXT
-// ======================================================
+bool initializeBuzzer() {
+  esp_timer_create_args_t arguments = {};
+  arguments.callback = buzzerTimerCallback;
+  arguments.dispatch_method = ESP_TIMER_TASK;
+  arguments.name = "rxBuzzer";
 
-const char* wifiStatusText(
-  wl_status_t status
-) {
-  switch (status) {
-    case WL_IDLE_STATUS:
-      return "IDLE";
+  return esp_timer_create(&arguments, &buzzerTimer) == ESP_OK;
+}
 
-    case WL_NO_SSID_AVAIL:
-      return "NO_SSID_AVAIL";
+void selfTest() {
+  Serial.println("Buzzer and LED self-test.");
 
-    case WL_SCAN_COMPLETED:
-      return "SCAN_COMPLETED";
+  for (int index = 0; index < 3; ++index) {
+    digitalWrite(LED, HIGH);
+    buzzerOnSound();
+    delay(200);
 
-    case WL_CONNECTED:
-      return "CONNECTED";
-
-    case WL_CONNECT_FAILED:
-      return "CONNECT_FAILED";
-
-    case WL_CONNECTION_LOST:
-      return "CONNECTION_LOST";
-
-    case WL_DISCONNECTED:
-      return "DISCONNECTED";
-
-    default:
-      return "UNKNOWN";
+    buzzerOffSound();
+    digitalWrite(LED, LOW);
+    delay(200);
   }
 }
 
-// ======================================================
-// ALARM STATUS
-// ======================================================
+// ------------------------------------------------------
+// CLOCK
+// ------------------------------------------------------
 
-bool allAlarmsCompleted() {
-  if (alarms.empty()) {
+bool readClock(struct tm& localTime) {
+  const time_t now = time(nullptr);
+
+  if (now < MIN_VALID_TIME) {
     return false;
   }
 
-  for (
-    size_t index = 0;
-    index < alarms.size();
-    index++
+  return localtime_r(&now, &localTime) != nullptr;
+}
+
+String dateKey(const struct tm& localTime) {
+  char buffer[11];
+
+  strftime(
+    buffer,
+    sizeof(buffer),
+    "%Y-%m-%d",
+    &localTime
+  );
+
+  return String(buffer);
+}
+
+// ------------------------------------------------------
+// MOTOR
+// ------------------------------------------------------
+
+void setHardwareFault(const char* message) {
+  hardwareFault = true;
+  systemArmed = false;
+  buzzerOffSound();
+  digitalWrite(LED, HIGH);
+
+  Serial.print("HARDWARE FAULT: ");
+  Serial.println(message);
+}
+
+bool moveCarouselToChamber(int chamberId) {
+  if (
+    chamberId < 1 ||
+    chamberId > NUMBER_OF_CHAMBERS
   ) {
-    if (!alarms[index].localDone) {
+    return false;
+  }
+
+  if (!carouselServo.attached()) {
+    return false;
+  }
+
+  buzzerOffSound();
+
+  const int angle = CHAMBER_POSITIONS[chamberId - 1];
+
+  Serial.print("SERVO COMMAND | Chamber ");
+  Serial.print(chamberId);
+  Serial.print(" | Angle ");
+  Serial.println(angle);
+
+  carouselServo.write(angle);
+  delay(SERVO_SETTLE_TIME_MS);
+
+  // This confirms completion of the software wait.
+  // The servo has no physical position feedback.
+  return true;
+}
+
+bool returnCarouselHome() {
+  if (!carouselServo.attached()) {
+    return false;
+  }
+
+  buzzerOffSound();
+  carouselServo.write(HOME_POSITION);
+  delay(SERVO_SETTLE_TIME_MS);
+
+  Serial.println("HOME command completed.");
+  return true;
+}
+
+bool validateGroup(const AlarmGroup& group) {
+  if (
+    group.groupId.isEmpty() ||
+    group.hour < 0 ||
+    group.hour > 23 ||
+    group.minute < 0 ||
+    group.minute > 59 ||
+    group.chamberIds.empty() ||
+    group.chamberIds.size() > NUMBER_OF_CHAMBERS
+  ) {
+    return false;
+  }
+
+  bool used[NUMBER_OF_CHAMBERS] = {};
+
+  for (int chamberId : group.chamberIds) {
+    if (
+      chamberId < 1 ||
+      chamberId > NUMBER_OF_CHAMBERS ||
+      used[chamberId - 1]
+    ) {
       return false;
     }
+
+    used[chamberId - 1] = true;
   }
 
   return true;
 }
 
-// ======================================================
-// CAROUSEL MOVEMENT
-// ======================================================
-
-bool moveCarouselToChamber(
-  int chamberIndex
+bool dispenseGroup(
+  const AlarmGroup& group,
+  time_t& dispensedAt
 ) {
-  if (
-    chamberIndex < 0 ||
-    chamberIndex >= NUMBER_OF_CHAMBERS
-  ) {
-    Serial.println(
-      "ERROR: Invalid chamber index."
-    );
+  dispensedAt = 0;
 
+  if (!validateGroup(group) || !carouselServo.attached()) {
     return false;
   }
 
-  int targetAngle =
-    chamberPositions[chamberIndex];
+  for (int chamberId : group.chamberIds) {
+    if (!moveCarouselToChamber(chamberId)) {
+      return false;
+    }
 
-  Serial.println();
-  Serial.println(
-    "=============================="
-  );
+    Serial.print("Dispense wait | Chamber ");
+    Serial.println(chamberId);
 
-  Serial.print(
-    "Moving carousel to Chamber "
-  );
+    delay(DISPENSE_DELAY_MS);
+  }
 
-  Serial.println(
-    chamberIndex + 1
-  );
+  // Preserve the actual group dispensing timestamp for SMS.
+  dispensedAt = time(nullptr);
 
-  Serial.print(
-    "Target angle: "
-  );
+  const bool containsLastChamber =
+    std::find(
+      group.chamberIds.begin(),
+      group.chamberIds.end(),
+      NUMBER_OF_CHAMBERS
+    ) != group.chamberIds.end();
 
-  Serial.print(
-    targetAngle
-  );
+  if (containsLastChamber && !returnCarouselHome()) {
+    return false;
+  }
 
-  Serial.println(
-    " degrees"
-  );
-
-  carouselServo.write(
-    targetAngle
-  );
-
-  delay(
-    SERVO_SETTLE_TIME_MS
-  );
-
-  Serial.print(
-    "Chamber "
-  );
-
-  Serial.print(
-    chamberIndex + 1
-  );
-
-  Serial.println(
-    " positioned."
-  );
-
-  Serial.println(
-    "=============================="
-  );
-
+  Serial.println("Dispensing sequence completed.");
   return true;
 }
 
-void returnCarouselHome() {
-  Serial.println();
-  Serial.println(
-    "=============================="
-  );
-
-  Serial.println(
-    "Returning carousel to HOME..."
-  );
-
-  carouselServo.write(
-    HOME_POSITION
-  );
-
-  delay(
-    SERVO_SETTLE_TIME_MS
-  );
-
-  currentChamberIndex =
-    0;
-
-  Serial.println(
-    "Carousel at HOME."
-  );
-
-  Serial.println(
-    "=============================="
-  );
-}
-
-// ======================================================
-// ULTRASONIC DISTANCE
-// ======================================================
+// ------------------------------------------------------
+// PICKUP SENSOR
+// ------------------------------------------------------
 
 float getDistanceCM() {
-  digitalWrite(
-    TRIG_PIN,
-    LOW
-  );
+  // A stuck-high echo is an invalid measurement.
+  if (digitalRead(ECHO_PIN) == HIGH) {
+    return -1.0;
+  }
 
-  delayMicroseconds(
-    2
-  );
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
 
-  digitalWrite(
-    TRIG_PIN,
-    HIGH
-  );
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
 
-  delayMicroseconds(
-    10
-  );
+  digitalWrite(TRIG_PIN, LOW);
 
-  digitalWrite(
-    TRIG_PIN,
-    LOW
+  const unsigned long duration = pulseIn(
+    ECHO_PIN,
+    HIGH,
+    SENSOR_ECHO_TIMEOUT_US
   );
-
-  /*
-   * 30,000 microseconds is approximately a 5-meter timeout.
-   * The timeout prevents pulseIn() from blocking indefinitely.
-   */
-  unsigned long duration =
-    pulseIn(
-      ECHO_PIN,
-      HIGH,
-      30000
-    );
 
   if (duration == 0) {
     return -1.0;
   }
 
-  return (
-    duration *
-    0.0343
-  ) / 2.0;
+  return duration * 0.0343f / 2.0f;
 }
 
-// ======================================================
-// IMMEDIATE HAND DETECTION
-// ======================================================
-
 bool detectHand() {
-  float distance =
-    getDistanceCM();
+  const float distance = getDistanceCM();
 
-  if (distance < 0) {
-    Serial.println(
-      "Ultrasonic reading timed out."
-    );
-
-    return false;
-  }
-
-  Serial.print(
-    "Ultrasonic distance: "
-  );
-
-  Serial.print(
-    distance,
-    2
-  );
-
-  Serial.println(
-    " cm"
-  );
-
-  /*
-   * One valid reading between 2 cm and 7 cm immediately
-   * confirms medication pickup.
-   */
+  // All four chambers use exactly one valid in-range reading.
   if (
     distance >= MIN_HAND_DISTANCE_CM &&
     distance <= MAX_HAND_DISTANCE_CM
   ) {
-    Serial.println(
-      "Hand detected within threshold."
-    );
+    Serial.print("PICKUP | Distance ");
+    Serial.print(distance, 2);
+    Serial.println(" cm");
 
     return true;
   }
@@ -552,2022 +425,693 @@ bool detectHand() {
   return false;
 }
 
-// ======================================================
-// SELF TEST
-// ======================================================
-
-void selfTest() {
-  Serial.println(
-    "Running buzzer and LED self-test..."
-  );
-
-  for (
-    int index = 0;
-    index < 3;
-    index++
-  ) {
-    digitalWrite(
-      LED,
-      HIGH
-    );
-
-    buzzerOnSound();
-
-    delay(
-      200
-    );
-
-    buzzerOffSound();
-
-    digitalWrite(
-      LED,
-      LOW
-    );
-
-    delay(
-      200
-    );
-  }
-
-  Serial.println(
-    "Self-test complete."
-  );
-}
-
-// ======================================================
-// WIFI
-// ======================================================
-
-bool connectWiFi() {
-  /*
-   * Never block hardware processing while an alarm is active.
-   */
-  if (alarmActive) {
-    return false;
-  }
-
-  Serial.println(
-    "Connecting to WiFi..."
-  );
-
-  WiFi.disconnect(
-    true,
-    true
-  );
-
-  delay(
-    200
-  );
-
-  WiFi.mode(
-    WIFI_STA
-  );
-
-  delay(
-    100
-  );
-
-  WiFi.begin(
-    ssid,
-    password
-  );
-
-  unsigned long start =
-    millis();
-
-  while (
-    WiFi.status() != WL_CONNECTED
-  ) {
-    if (alarmActive) {
-      Serial.println(
-        "WiFi connection stopped because an alarm became active."
-      );
-
-      return false;
-    }
-
-    if (
-      millis() - start >=
-      WIFI_CONNECT_TIMEOUT_MS
-    ) {
-      Serial.println();
-
-      Serial.print(
-        "WiFi connection timed out. Status: "
-      );
-
-      Serial.println(
-        wifiStatusText(
-          WiFi.status()
-        )
-      );
-
-      return false;
-    }
-
-    Serial.print(
-      "."
-    );
-
-    delay(
-      300
-    );
-  }
-
-  Serial.println();
-  Serial.println(
-    "WiFi connected."
-  );
-
-  Serial.print(
-    "ESP32 IP: "
-  );
-
-  Serial.println(
-    WiFi.localIP()
-  );
-
-  return true;
-}
-
-void ensureWiFi() {
-  if (
-    alarmActive ||
-    WiFi.status() == WL_CONNECTED
-  ) {
-    return;
-  }
-
-  unsigned long now =
-    millis();
-
-  if (
-    now - lastWiFiAttempt <
-    WIFI_RETRY_INTERVAL_MS
-  ) {
-    return;
-  }
-
-  lastWiFiAttempt =
-    now;
-
-  connectWiFi();
-}
-
-// ======================================================
-// TIME FORMAT
-// ======================================================
-
-String formatTime(
-  int hour,
-  int minute
-) {
-  String hours =
-    hour < 10
-      ? "0" + String(hour)
-      : String(hour);
-
-  String minutes =
-    minute < 10
-      ? "0" + String(minute)
-      : String(minute);
-
-  return (
-    hours +
-    ":" +
-    minutes
-  );
-}
-
-// ======================================================
-// EVENT IDENTIFIER
-// ======================================================
+// ------------------------------------------------------
+// EVENT QUEUE
+//
+// These functions are called while stateMutex is held.
+// ------------------------------------------------------
 
 String createEventId(
   const String& status,
   const AlarmGroup& group
 ) {
-  return (
-    group.groupId +
-    "_" +
-    status
-  );
+  return group.groupId + "_" + status;
 }
 
-// ======================================================
-// SEND EVENT TO BACKEND
-// ======================================================
-
-bool sendRxBoxEvent(
+bool queueEvent(
   const char* status,
-  AlarmGroup& group,
-  int snoozeCount
+  const AlarmGroup& group,
+  int snoozeCount,
+  time_t dispensedAt
 ) {
-  /*
-   * HTTP is prohibited while the hardware alarm is active.
-   */
-  if (alarmActive) {
-    Serial.println(
-      "Event send postponed: alarm hardware is active."
-    );
+  const String eventId = createEventId(String(status), group);
 
-    return false;
-  }
-
-  ensureWiFi();
-
-  if (
-    WiFi.status() != WL_CONNECTED
-  ) {
-    Serial.println(
-      "Cannot send event: no WiFi."
-    );
-
-    return false;
-  }
-
-  DynamicJsonDocument doc(
-    1024
-  );
-
-  String statusText =
-    String(status);
-
-  String eventId =
-    createEventId(
-      statusText,
-      group
-    );
-
-  doc["deviceId"] =
-    deviceID;
-
-  doc["eventId"] =
-    eventId;
-
-  doc["planId"] =
-    currentPlanId;
-
-  doc["groupId"] =
-    group.groupId;
-
-  doc["status"] =
-    statusText;
-
-  doc["scheduledTime"] =
-    group.scheduledTime;
-
-  doc["snoozeCount"] =
-    snoozeCount;
-
-  JsonArray chamberArray =
-    doc.createNestedArray(
-      "chamberIds"
-    );
-
-  for (
-    int chamberId :
-    group.chamberIds
-  ) {
-    chamberArray.add(
-      chamberId
-    );
-  }
-
-  String payload;
-
-  serializeJson(
-    doc,
-    payload
-  );
-
-  Serial.println();
-  Serial.println(
-    "Sending Rx Box event:"
-  );
-
-  Serial.println(
-    payload
-  );
-
-  HTTPClient http;
-
-  if (!http.begin(eventURL)) {
-    Serial.println(
-      "Unable to initialize event HTTP request."
-    );
-
-    return false;
-  }
-
-  http.setConnectTimeout(
-    HTTP_CONNECT_TIMEOUT_MS
-  );
-
-  http.setTimeout(
-    HTTP_READ_TIMEOUT_MS
-  );
-
-  http.setReuse(
-    false
-  );
-
-  http.addHeader(
-    "Content-Type",
-    "application/json"
-  );
-
-  http.addHeader(
-    "x-sensor-key",
-    sensorApiKey
-  );
-
-  int httpCode =
-    http.POST(
-      payload
-    );
-
-  Serial.print(
-    "Event POST code: "
-  );
-
-  Serial.println(
-    httpCode
-  );
-
-  bool successful =
-    httpCode >= 200 &&
-    httpCode < 300;
-
-  if (httpCode > 0) {
-    String response =
-      http.getString();
-
-    if (!response.isEmpty()) {
-      Serial.print(
-        "Event response: "
-      );
-
-      Serial.println(
-        response
-      );
-    }
-  } else {
-    Serial.print(
-      "Event POST failed: "
-    );
-
-    Serial.println(
-      http.errorToString(
-        httpCode
-      )
-    );
-  }
-
-  http.end();
-
-  if (successful) {
-    Serial.print(
-      "Event acknowledged: "
-    );
-
-    Serial.println(
-      eventId
-    );
-  } else {
-    Serial.println(
-      "Backend did not acknowledge the event."
-    );
-  }
-
-  return successful;
-}
-
-// ======================================================
-// PENDING EVENT QUEUE
-// ======================================================
-
-bool isEventAlreadyQueued(
-  const String& eventId
-) {
-  for (
-    const PendingRxBoxEvent& pending :
-    pendingEvents
-  ) {
-    String pendingId =
-      createEventId(
-        pending.status,
-        pending.group
-      );
-
-    if (pendingId == eventId) {
+  for (const PendingRxBoxEvent& existing : pendingEvents) {
+    if (
+      createEventId(existing.status, existing.group) == eventId
+    ) {
       return true;
     }
   }
 
-  return false;
-}
-
-void removeQueuedEvent(
-  const String& groupId,
-  const String& status
-) {
-  for (
-    int index =
-      static_cast<int>(
-        pendingEvents.size()
-      ) - 1;
-
-    index >= 0;
-
-    index--
-  ) {
-    if (
-      pendingEvents[index].group.groupId == groupId &&
-      pendingEvents[index].status == status
-    ) {
-      pendingEvents.erase(
-        pendingEvents.begin() +
-        index
-      );
-    }
-  }
-}
-
-void queueRxBoxEvent(
-  const char* status,
-  AlarmGroup& group,
-  int snoozeCount
-) {
-  String statusText =
-    String(status);
-
-  String eventId =
-    createEventId(
-      statusText,
-      group
-    );
-
-  if (
-    isEventAlreadyQueued(
-      eventId
-    )
-  ) {
-    Serial.print(
-      "Event is already queued: "
-    );
-
-    Serial.println(
-      eventId
-    );
-
-    return;
-  }
-
-  if (
-    pendingEvents.size() >=
-    MAX_PENDING_EVENTS
-  ) {
-    Serial.println(
-      "ERROR: Pending backend event queue is full."
-    );
-
-    return;
-  }
-
-  PendingRxBoxEvent pending;
-
-  pending.status =
-    statusText;
-
-  pending.group =
-    group;
-
-  pending.snoozeCount =
-    snoozeCount;
-
-  pending.lastAttempt =
-    millis();
-
-  pendingEvents.push_back(
-    pending
-  );
-
-  Serial.print(
-    "Backend event queued: "
-  );
-
-  Serial.println(
-    eventId
-  );
-}
-
-void processPendingRxBoxEvents() {
-  if (
-    alarmActive ||
-    pendingEvents.empty()
-  ) {
-    return;
-  }
-
-  unsigned long now =
-    millis();
-
-  for (
-    size_t index = 0;
-    index < pendingEvents.size();
-    index++
-  ) {
-    if (
-      now -
-      pendingEvents[index].lastAttempt <
-      EVENT_RETRY_INTERVAL_MS
-    ) {
-      continue;
-    }
-
-    pendingEvents[index].lastAttempt =
-      now;
-
-    String completedStatus =
-      pendingEvents[index].status;
-
-    String completedGroupId =
-      pendingEvents[index].group.groupId;
-
-    Serial.print(
-      "Sending queued event: "
-    );
-
-    Serial.println(
-      createEventId(
-        pendingEvents[index].status,
-        pendingEvents[index].group
-      )
-    );
-
-    bool sent =
-      sendRxBoxEvent(
-        pendingEvents[index].status.c_str(),
-        pendingEvents[index].group,
-        pendingEvents[index].snoozeCount
-      );
-
-    if (sent) {
-      pendingEvents.erase(
-        pendingEvents.begin() +
-        index
-      );
-
-      Serial.println(
-        "Queued event delivered."
-      );
-
-      if (
-        completedStatus == "taken" ||
-        completedStatus == "missed"
-      ) {
-        removeQueuedEvent(
-          completedGroupId,
-          "dispensed"
-        );
-      }
-    } else {
-      Serial.println(
-        "Queued event still failed. It will be retried."
-      );
-    }
-
-    /*
-     * Process only one queued event per loop.
-     */
-    break;
-  }
-}
-
-// ======================================================
-// FETCH SCHEDULE
-// ======================================================
-
-void fetchSchedule() {
-  if (alarmActive) {
-    Serial.println(
-      "Schedule refresh skipped: alarm active."
-    );
-
-    return;
-  }
-
-  if (
-    WiFi.status() != WL_CONNECTED
-  ) {
-    return;
-  }
-
-  HTTPClient http;
-
-  String url =
-    String(scheduleURL) +
-    "?deviceId=" +
-    String(deviceID);
-
-  if (!http.begin(url)) {
-    Serial.println(
-      "Unable to initialize schedule request."
-    );
-
-    return;
-  }
-
-  http.setConnectTimeout(
-    HTTP_CONNECT_TIMEOUT_MS
-  );
-
-  http.setTimeout(
-    HTTP_READ_TIMEOUT_MS
-  );
-
-  http.setFollowRedirects(
-    HTTPC_STRICT_FOLLOW_REDIRECTS
-  );
-
-  http.setReuse(
-    false
-  );
-
-  http.addHeader(
-    "x-sensor-key",
-    sensorApiKey
-  );
-
-  Serial.println();
-  Serial.println(
-    "Fetching schedule:"
-  );
-
-  Serial.println(
-    url
-  );
-
-  int httpCode =
-    http.GET();
-
-  Serial.print(
-    "Schedule HTTP code: "
-  );
-
-  Serial.println(
-    httpCode
-  );
-
-  if (
-    httpCode == 200 ||
-    httpCode == 409
-  ) {
-    String payload =
-      http.getString();
-
-    Serial.println(
-      "----- SERVER RESPONSE -----"
-    );
-
-    Serial.println(
-      payload
-    );
-
-    Serial.println(
-      "---------------------------"
-    );
-
-    DynamicJsonDocument doc(
-      6144
-    );
-
-    DeserializationError error =
-      deserializeJson(
-        doc,
-        payload
-      );
-
-    if (error) {
-      Serial.print(
-        "Schedule JSON error: "
-      );
-
-      Serial.println(
-        error.c_str()
-      );
-
-      http.end();
-
-      return;
-    }
-
-    bool success =
-      doc["success"] |
-      false;
-
-    if (!success) {
-      Serial.print(
-        "Server returned success=false: "
-      );
-
-      Serial.println(
-        doc["error"].as<String>()
-      );
-
-      systemArmed =
-        false;
-
-      alarms.clear();
-
-      http.end();
-
-      return;
-    }
-
-    bool hardwareEnabled =
-      doc["hardwareDispensingEnabled"] |
-      false;
-
-    currentPlanId =
-      doc["planId"].as<String>();
-
-    systemArmed =
-      hardwareEnabled;
-
-    if (!hardwareEnabled) {
-      Serial.print(
-        "Hardware dispensing disabled: "
-      );
-
-      Serial.println(
-        doc["message"].as<String>()
-      );
-
-      alarms.clear();
-
-      http.end();
-
-      return;
-    }
-
-    JsonArray groupsArray =
-      doc["groups"].as<JsonArray>();
-
-    std::vector<AlarmGroup> oldAlarms =
-      alarms;
-
-    alarms.clear();
-
-    for (
-      JsonObject object :
-      groupsArray
-    ) {
-      AlarmGroup group;
-
-      group.groupId =
-        object["groupId"].as<String>();
-
-      group.hour =
-        object["hour"] |
-        0;
-
-      group.minute =
-        object["minute"] |
-        0;
-
-      group.scheduledTime =
-        object["scheduledTime"].as<String>();
-
-      group.status =
-        object["status"].as<String>();
-
-      group.localDone =
-        false;
-
-      JsonArray chamberArray =
-        object["chamberIds"].as<JsonArray>();
-
-      for (
-        JsonVariant value :
-        chamberArray
-      ) {
-        group.chamberIds.push_back(
-          value.as<int>()
-        );
-      }
-
-      /*
-       * Preserve completion state during schedule refresh.
-       */
-      for (
-        size_t oldIndex = 0;
-        oldIndex < oldAlarms.size();
-        oldIndex++
-      ) {
-        if (
-          !group.groupId.isEmpty() &&
-          oldAlarms[oldIndex].groupId ==
-            group.groupId
-        ) {
-          group.localDone =
-            oldAlarms[oldIndex].localDone;
-
-          break;
-        }
-      }
-
-      /*
-       * A final backend status is authoritative.
-       */
-      if (
-        group.status == "taken" ||
-        group.status == "late" ||
-        group.status == "missed"
-      ) {
-        group.localDone =
-          true;
-      }
-
-      alarms.push_back(
-        group
-      );
-
-      Serial.print(
-        "Loaded group: "
-      );
-
-      Serial.print(
-        group.groupId
-      );
-
-      Serial.print(
-        " at "
-      );
-
-      Serial.print(
-        formatTime(
-          group.hour,
-          group.minute
-        )
-      );
-
-      Serial.print(
-        " | Chambers: "
-      );
-
-      for (
-        int chamberId :
-        group.chamberIds
-      ) {
-        Serial.print(
-          chamberId
-        );
-
-        Serial.print(
-          " "
-        );
-      }
-
-      Serial.print(
-        "| Status: "
-      );
-
-      Serial.print(
-        group.status
-      );
-
-      Serial.print(
-        " | Local done: "
-      );
-
-      Serial.println(
-        group.localDone
-          ? "true"
-          : "false"
-      );
-    }
-
-    Serial.print(
-      "Total alarm groups: "
-    );
-
-    Serial.println(
-      alarms.size()
-    );
-
-    /*
-     * Physical failsafe when every server group is complete.
-     */
-    if (allAlarmsCompleted()) {
-      buzzerOn =
-        false;
-
-      buzzerOffSound();
-
-      digitalWrite(
-        LED,
-        LOW
-      );
-    }
-  } else {
-    String response =
-      http.getString();
-
-    Serial.println(
-      "Failed to fetch schedule."
-    );
-
-    if (httpCode < 0) {
-      Serial.println(
-        http.errorToString(
-          httpCode
-        )
-      );
-    }
-
-    if (!response.isEmpty()) {
-      Serial.print(
-        "Server response: "
-      );
-
-      Serial.println(
-        response
-      );
-    }
-  }
-
-  http.end();
-}
-
-// ======================================================
-// DISPENSE MEDICINE
-// ======================================================
-
-bool dispenseMedicine(
-  AlarmGroup& group
-) {
-  if (group.chamberIds.empty()) {
-    Serial.println(
-      "ERROR: No chambers assigned."
-    );
-
+  if (pendingEvents.size() >= MAX_PENDING_EVENTS) {
+    Serial.println("ERROR: Event queue full.");
     return false;
   }
 
-  Serial.println();
-  Serial.println(
-    "=============================="
-  );
+  PendingRxBoxEvent event;
+  event.status = status;
+  event.group = group;
+  event.planId = currentPlanId;
+  event.snoozeCount = snoozeCount;
+  event.dispensedAt = dispensedAt;
 
-  Serial.println(
-    "DISPENSING MEDICINE"
-  );
+  pendingEvents.push_back(event);
 
-  Serial.print(
-    "Group: "
-  );
-
-  Serial.println(
-    group.groupId
-  );
-
-  Serial.print(
-    "Scheduled: "
-  );
-
-  Serial.println(
-    group.scheduledTime
-  );
-
-  bool dispensedAny =
-    false;
-
-  /*
-   * If a group has multiple chambers, for example [2,3],
-   * both chambers are moved and dispensed sequentially.
-   */
-  for (
-    int chamberId :
-    group.chamberIds
-  ) {
-    int chamberIndex =
-      chamberId - 1;
-
-    if (
-      chamberIndex < 0 ||
-      chamberIndex >= NUMBER_OF_CHAMBERS
-    ) {
-      Serial.print(
-        "Invalid chamber ID: "
-      );
-
-      Serial.println(
-        chamberId
-      );
-
-      continue;
-    }
-
-    Serial.print(
-      "Dispensing Chamber "
-    );
-
-    Serial.println(
-      chamberId
-    );
-
-    Serial.print(
-      "Servo angle: "
-    );
-
-    Serial.println(
-      chamberPositions[chamberIndex]
-    );
-
-    if (
-      !moveCarouselToChamber(
-        chamberIndex
-      )
-    ) {
-      continue;
-    }
-
-    Serial.println(
-      "Waiting for medicine to fall..."
-    );
-
-    delay(
-      DISPENSE_DELAY_MS
-    );
-
-    Serial.println(
-      "Medicine dispensed."
-    );
-
-    dispensedAny =
-      true;
-
-    if (
-      chamberId ==
-      NUMBER_OF_CHAMBERS
-    ) {
-      returnCarouselHome();
-    } else {
-      currentChamberIndex =
-        chamberIndex + 1;
-    }
-  }
-
-  Serial.println(
-    "=============================="
-  );
-
-  if (!dispensedAny) {
-    return false;
-  }
-
-  medicineDispensed =
-    true;
-
-  waitingForHand =
-    true;
-
-  /*
-   * Zero forces an immediate sensor reading.
-   */
-  lastUltrasonicCheck =
-    0;
+  Serial.print("Queued event: ");
+  Serial.println(eventId);
 
   return true;
 }
 
-// ======================================================
-// RESET ALARM
-// ======================================================
+bool postEvent(const PendingRxBoxEvent& event) {
+  DynamicJsonDocument doc(1536);
+
+  doc["deviceId"] = deviceID;
+  doc["eventId"] = createEventId(event.status, event.group);
+  doc["planId"] = event.planId;
+  doc["groupId"] = event.group.groupId;
+  doc["status"] = event.status;
+  doc["scheduledTime"] = event.group.scheduledTime;
+  doc["snoozeCount"] = event.snoozeCount;
+
+  if (
+    event.status == "dispensed" &&
+    event.dispensedAt >= MIN_VALID_TIME
+  ) {
+    doc["dispensedAt"] =
+      static_cast<int64_t>(event.dispensedAt);
+  }
+
+  JsonArray chambers = doc.createNestedArray("chamberIds");
+
+  for (int chamberId : event.group.chamberIds) {
+    chambers.add(chamberId);
+  }
+
+  String payload;
+  serializeJson(doc, payload);
+
+  HTTPClient http;
+
+  if (!http.begin(eventURL)) {
+    return false;
+  }
+
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_READ_TIMEOUT_MS);
+  http.setReuse(false);
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-sensor-key", sensorApiKey);
+
+  const int code = http.POST(payload);
+
+  Serial.print("Event HTTP ");
+  Serial.print(code);
+  Serial.print(" | ");
+  Serial.println(createEventId(event.status, event.group));
+
+  bool acknowledged = false;
+
+  if (code >= 200 && code < 300) {
+    DynamicJsonDocument response(8192);
+
+    const DeserializationError error =
+      deserializeJson(response, http.getString());
+
+    acknowledged =
+      !error &&
+      response["success"].as<bool>();
+  }
+
+  http.end();
+  return acknowledged;
+}
+
+bool processOneNetworkEvent() {
+  PendingRxBoxEvent event;
+  bool available = false;
+
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+
+  // Preserve event order. A final status cannot overtake dispensing.
+  if (!pendingEvents.empty()) {
+    PendingRxBoxEvent& first = pendingEvents.front();
+
+    const unsigned long now = millis();
+
+    if (
+      !first.attempted ||
+      now - first.lastAttempt >= EVENT_RETRY_INTERVAL_MS
+    ) {
+      first.attempted = true;
+      first.lastAttempt = now;
+      event = first;
+      available = true;
+    }
+  }
+
+  xSemaphoreGive(stateMutex);
+
+  if (!available) {
+    return false;
+  }
+
+  // No state lock is held during HTTP.
+  if (postEvent(event)) {
+    const String eventId =
+      createEventId(event.status, event.group);
+
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+
+    for (size_t index = 0; index < pendingEvents.size(); ++index) {
+      if (
+        createEventId(
+          pendingEvents[index].status,
+          pendingEvents[index].group
+        ) == eventId
+      ) {
+        pendingEvents.erase(pendingEvents.begin() + index);
+        break;
+      }
+    }
+
+    xSemaphoreGive(stateMutex);
+  }
+
+  return true;
+}
+
+// ------------------------------------------------------
+// SCHEDULE
+// ------------------------------------------------------
+
+void fetchSchedule() {
+  HTTPClient http;
+
+  const String url =
+    String(scheduleURL) + "?deviceId=" + deviceID;
+
+  if (!http.begin(url)) {
+    return;
+  }
+
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_READ_TIMEOUT_MS);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setReuse(false);
+  http.addHeader("x-sensor-key", sensorApiKey);
+
+  const int code = http.GET();
+
+  if (code != 200 && code != 409) {
+    Serial.print("Schedule HTTP error: ");
+    Serial.println(code);
+    http.end();
+    return;
+  }
+
+  DynamicJsonDocument doc(8192);
+
+  const DeserializationError error =
+    deserializeJson(doc, http.getString());
+
+  http.end();
+
+  if (error || !doc["success"].as<bool>()) {
+    Serial.println("Schedule response rejected.");
+    return;
+  }
+
+  const bool enabled =
+    doc["hardwareDispensingEnabled"] | false;
+
+  const String planId = doc["planId"].as<String>();
+  const String planDate = doc["date"].as<String>();
+
+  if (planId.isEmpty() || planDate.isEmpty()) {
+    Serial.println("Schedule has no valid plan identity.");
+    return;
+  }
+
+  std::vector<AlarmGroup> loaded;
+
+  if (enabled) {
+    if (!doc["groups"].is<JsonArray>()) {
+      Serial.println("Schedule groups are invalid.");
+      return;
+    }
+
+    bool assigned[NUMBER_OF_CHAMBERS] = {};
+
+    for (JsonObject object : doc["groups"].as<JsonArray>()) {
+      AlarmGroup group;
+
+      group.groupId = object["groupId"].as<String>();
+      group.hour = object["hour"] | -1;
+      group.minute = object["minute"] | -1;
+      group.scheduledTime =
+        object["scheduledTime"].as<String>();
+      group.status = object["status"].as<String>();
+
+      for (
+        JsonVariant value :
+        object["chamberIds"].as<JsonArray>()
+      ) {
+        group.chamberIds.push_back(value.as<int>());
+      }
+
+      if (!validateGroup(group)) {
+        Serial.println("Invalid schedule group rejected.");
+        return;
+      }
+
+      for (int chamberId : group.chamberIds) {
+        if (assigned[chamberId - 1]) {
+          Serial.println("Duplicate chamber assignment rejected.");
+          return;
+        }
+
+        assigned[chamberId - 1] = true;
+      }
+
+      // A server-recorded dispense must not dispense again after reboot.
+      group.started =
+        group.status == "dispensed" ||
+        group.status == "taken" ||
+        group.status == "late" ||
+        group.status == "missed";
+
+      group.localDone =
+        group.status == "taken" ||
+        group.status == "late" ||
+        group.status == "missed";
+
+      loaded.push_back(group);
+    }
+  }
+
+  std::sort(
+    loaded.begin(),
+    loaded.end(),
+    [](const AlarmGroup& left, const AlarmGroup& right) {
+      return left.hour * 60 + left.minute <
+             right.hour * 60 + right.minute;
+    }
+  );
+
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+
+  // A refresh must never replace the active alarm's group.
+  if (!alarmActive && !hardwareFault) {
+    if (planDate == currentPlanDate) {
+      for (AlarmGroup& group : loaded) {
+        for (const AlarmGroup& old : alarms) {
+          if (old.groupId == group.groupId) {
+            group.started = group.started || old.started;
+            group.localDone = group.localDone || old.localDone;
+            break;
+          }
+        }
+      }
+    }
+
+    alarms.swap(loaded);
+    currentPlanId = planId;
+    currentPlanDate = planDate;
+    systemArmed = enabled;
+
+    Serial.print("Schedule loaded | ");
+    Serial.print(currentPlanDate);
+    Serial.print(" | Groups ");
+    Serial.println(alarms.size());
+  }
+
+  xSemaphoreGive(stateMutex);
+}
+
+// ------------------------------------------------------
+// NETWORK TASK
+// ------------------------------------------------------
+
+void networkTask(void*) {
+  unsigned long lastWiFiAttempt = 0;
+  unsigned long lastFetch = 0;
+  bool attemptedWiFi = false;
+  bool fetched = false;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+
+  while (true) {
+    const unsigned long now = millis();
+
+    if (WiFi.status() != WL_CONNECTED) {
+      if (
+        !attemptedWiFi ||
+        now - lastWiFiAttempt >= WIFI_RETRY_INTERVAL_MS
+      ) {
+        attemptedWiFi = true;
+        lastWiFiAttempt = now;
+
+        Serial.println("Starting WiFi connection.");
+        WiFi.begin(ssid, password);
+      }
+
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    const bool processedEvent = processOneNetworkEvent();
+
+    bool mayFetch = false;
+
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    mayFetch = !alarmActive;
+    xSemaphoreGive(stateMutex);
+
+    if (
+      !processedEvent &&
+      mayFetch &&
+      (!fetched || millis() - lastFetch >= SCHEDULE_FETCH_INTERVAL_MS)
+    ) {
+      fetched = true;
+      lastFetch = millis();
+      fetchSchedule();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// ------------------------------------------------------
+// ALARM
+//
+// Called only by the main loop while stateMutex is held.
+// ------------------------------------------------------
 
 void resetAlarmState() {
-  alarmActive =
-    false;
+  alarmActive = false;
+  buzzerOn = false;
+  waitingForHand = false;
 
-  buzzerOn =
-    false;
-
-  medicineDispensed =
-    false;
-
-  waitingForHand =
-    false;
-
-  currentPhase =
-    0;
-
-  activeAlarmIndex =
-    -1;
-
-  buzzerStart =
-    0;
-
-  buzzerCycleStart =
-    0;
-
-  snoozeWaitStart =
-    0;
-
-  lastUltrasonicCheck =
-    0;
+  activeAlarmIndex = -1;
+  currentPhase = 0;
 
   buzzerOffSound();
-
-  digitalWrite(
-    LED,
-    LOW
-  );
-
-  Serial.println(
-    "Alarm fully reset."
-  );
+  digitalWrite(LED, LOW);
 }
-
-// ======================================================
-// START BUZZER
-// ======================================================
 
 void startBuzzer() {
-  buzzerOn =
-    true;
+  buzzerOn = true;
+  buzzerStartedAt = millis();
 
-  buzzerStart =
-    millis();
-
-  buzzerCycleStart =
-    buzzerStart;
-
-  /*
-   * Force the first sensor read immediately.
-   */
-  lastUltrasonicCheck =
-    0;
-
-  Serial.println();
-  Serial.println(
-    "=============================="
-  );
-
-  if (currentPhase == 0) {
-    Serial.println(
-      "INITIAL ALARM"
-    );
-  } else {
-    Serial.print(
-      "SNOOZE #"
-    );
-
-    Serial.println(
-      currentPhase
-    );
-  }
-
-  Serial.println(
-    "Buzzer ON for one minute."
-  );
-
-  Serial.print(
-    "Ultrasonic armed immediately. Hand range: "
-  );
-
-  Serial.print(
-    MIN_HAND_DISTANCE_CM,
-    2
-  );
-
-  Serial.print(
-    " to "
-  );
-
-  Serial.print(
-    MAX_HAND_DISTANCE_CM,
-    2
-  );
-
-  Serial.println(
-    " cm."
-  );
-
-  Serial.println(
-    "=============================="
-  );
+  Serial.print("Alarm phase ");
+  Serial.println(currentPhase);
 }
 
-// ======================================================
-// START SNOOZE WAIT
-// ======================================================
-
-void startSnoozeWait() {
-  buzzerOn =
-    false;
-
+void completeAlarm(bool taken) {
+  buzzerOn = false;
   buzzerOffSound();
-
-  digitalWrite(
-    LED,
-    LOW
-  );
-
-  snoozeWaitStart =
-    millis();
-
-  Serial.println();
-  Serial.println(
-    "=============================="
-  );
-
-  Serial.println(
-    "NO HAND DETECTED"
-  );
-
-  Serial.println(
-    "Starting five-minute wait..."
-  );
-
-  Serial.println(
-    "Ultrasonic remains active during the wait."
-  );
-
-  Serial.println(
-    "=============================="
-  );
-}
-
-// ======================================================
-// COMPLETE TAKEN EVENT
-// ======================================================
-
-void completeTakenEvent() {
-  /*
-   * Stop the physical buzzer before doing anything else.
-   */
-  buzzerOn =
-    false;
-
-  buzzerOffSound();
-
-  digitalWrite(
-    LED,
-    LOW
-  );
-
-  Serial.println();
-  Serial.println(
-    "=============================="
-  );
-
-  Serial.println(
-    "HAND DETECTED"
-  );
-
-  Serial.println(
-    "MEDICINE PICKUP DETECTED"
-  );
-
-  Serial.print(
-    "Completed during phase: "
-  );
-
-  Serial.println(
-    currentPhase
-  );
-
-  Serial.println(
-    "=============================="
-  );
+  digitalWrite(LED, LOW);
 
   if (
-    activeAlarmIndex >= 0 &&
-    activeAlarmIndex <
-      static_cast<int>(
-        alarms.size()
-      )
+    activeAlarmIndex < 0 ||
+    activeAlarmIndex >= static_cast<int>(alarms.size())
   ) {
-    alarms[activeAlarmIndex].localDone =
-      true;
-
-    /*
-     * Queue the backend event. Do not make an HTTP request
-     * until the alarm has been safely reset.
-     */
-    queueRxBoxEvent(
-      "taken",
-      alarms[activeAlarmIndex],
-      currentPhase
-    );
-  }
-
-  if (allAlarmsCompleted()) {
-    Serial.println(
-      "ALL MEDICATIONS COMPLETED"
-    );
-
-    returnCarouselHome();
-  }
-
-  resetAlarmState();
-}
-
-// ======================================================
-// COMPLETE MISSED EVENT
-// ======================================================
-
-void completeMissedEvent() {
-  buzzerOn =
-    false;
-
-  buzzerOffSound();
-
-  digitalWrite(
-    LED,
-    LOW
-  );
-
-  Serial.println();
-  Serial.println(
-    "=============================="
-  );
-
-  Serial.println(
-    "MEDICATION MISSED"
-  );
-
-  Serial.println(
-    "=============================="
-  );
-
-  if (
-    activeAlarmIndex >= 0 &&
-    activeAlarmIndex <
-      static_cast<int>(
-        alarms.size()
-      )
-  ) {
-    alarms[activeAlarmIndex].localDone =
-      true;
-
-    queueRxBoxEvent(
-      "missed",
-      alarms[activeAlarmIndex],
-      currentPhase
-    );
-  }
-
-  if (allAlarmsCompleted()) {
-    Serial.println(
-      "All alarm groups finished."
-    );
-
-    returnCarouselHome();
-  }
-
-  resetAlarmState();
-}
-
-// ======================================================
-// ACTIVE ALARM PROCESSING
-// ======================================================
-
-void processActiveAlarm(
-  unsigned long now
-) {
-  if (
-    !alarmActive ||
-    !medicineDispensed ||
-    !waitingForHand
-  ) {
+    setHardwareFault("Active group index is invalid.");
+    resetAlarmState();
     return;
   }
 
-  /*
-   * Process the buzzer pattern.
-   */
-  if (buzzerOn) {
-    unsigned long cycle =
-      (
-        now -
-        buzzerCycleStart
-      ) %
-      1000;
+  AlarmGroup& group = alarms[activeAlarmIndex];
 
-    if (cycle < 300) {
-      buzzerOnSound();
-    } else {
-      buzzerOffSound();
-    }
+  if (
+    !queueEvent(
+      taken ? "taken" : "missed",
+      group,
+      currentPhase,
+      0
+    )
+  ) {
+    setHardwareFault("Could not queue final medication event.");
+  }
 
-    if (
-      now -
-      buzzerStart >=
-      ALARM_DURATION_MS
-    ) {
-      Serial.println(
-        "One-minute alarm finished."
-      );
+  group.localDone = true;
 
-      startSnoozeWait();
+  bool allDone = !alarms.empty();
+
+  for (const AlarmGroup& candidate : alarms) {
+    if (!candidate.localDone) {
+      allDone = false;
+      break;
     }
   }
 
-  /*
-   * The ultrasonic sensor remains active during:
-   * - initial alarm
-   * - buzzer-off portion
-   * - five-minute snooze wait
-   * - repeated snooze alarms
-   */
+  if (allDone && !returnCarouselHome()) {
+    setHardwareFault("Could not issue HOME command.");
+  }
+
+  resetAlarmState();
+
+  if (hardwareFault) {
+    digitalWrite(LED, HIGH);
+  }
+}
+
+void processActiveAlarm() {
+  unsigned long now = millis();
+
+  if (buzzerOn) {
+    if (now - buzzerStartedAt >= ALARM_DURATION_MS) {
+      buzzerOn = false;
+      buzzerOffSound();
+      snoozeStartedAt = millis();
+      Serial.println("Snooze wait started.");
+    } else {
+      const unsigned long cycle =
+        (now - buzzerStartedAt) % 1000;
+
+      if (cycle < 300) {
+        buzzerOnSound();
+      } else {
+        buzzerOffSound();
+      }
+    }
+  }
+
+  now = millis();
+
   if (
-    now -
-    lastUltrasonicCheck >=
-    ULTRASONIC_CHECK_INTERVAL_MS
+    waitingForHand &&
+    now - pickupEnabledAt >= SENSOR_SETTLE_MS &&
+    now - lastSensorCheck >= SENSOR_CHECK_INTERVAL_MS
   ) {
-    lastUltrasonicCheck =
-      now;
+    lastSensorCheck = now;
 
     if (detectHand()) {
-      completeTakenEvent();
-
+      completeAlarm(true);
       return;
     }
   }
 
-  /*
-   * Handle snooze or missed state after the buzzer has stopped.
-   */
+  // Refresh after sensor reads and after snoozeStartedAt changes.
+  now = millis();
+
   if (
-    alarmActive &&
     !buzzerOn &&
-    now -
-      snoozeWaitStart >=
-      SNOOZE_WAIT_MS
+    now - snoozeStartedAt >= SNOOZE_WAIT_MS
   ) {
-    currentPhase++;
+    ++currentPhase;
 
-    if (
-      currentPhase <=
-      MAX_SNOOZES
-    ) {
-      Serial.println();
-      Serial.println(
-        "=============================="
-      );
-
-      Serial.print(
-        "Starting SNOOZE #"
-      );
-
-      Serial.println(
-        currentPhase
-      );
-
-      Serial.println(
-        "=============================="
-      );
-
+    if (currentPhase <= MAX_SNOOZES) {
       startBuzzer();
     } else {
-      completeMissedEvent();
+      completeAlarm(false);
+      return;
     }
   }
 
-  digitalWrite(
-    LED,
-    buzzerOn
-      ? HIGH
-      : LOW
-  );
+  digitalWrite(LED, buzzerOn ? HIGH : LOW);
 }
 
-// ======================================================
-// TRIGGER NEXT DUE ALARM
-// ======================================================
-
-void triggerDueAlarm(
-  int hour,
-  int minute
-) {
+void triggerDueAlarm(const struct tm& localTime) {
   if (
     alarmActive ||
-    !systemArmed
+    !systemArmed ||
+    hardwareFault ||
+    currentPlanDate != dateKey(localTime)
   ) {
     return;
   }
 
-  int currentMinutes =
-    hour * 60 +
-    minute;
+  const int currentMinutes =
+    localTime.tm_hour * 60 + localTime.tm_min;
 
-  for (
-    size_t index = 0;
-    index < alarms.size();
-    index++
-  ) {
+  for (size_t index = 0; index < alarms.size(); ++index) {
+    AlarmGroup& group = alarms[index];
+
+    if (group.started || group.localDone) {
+      continue;
+    }
+
+    const int scheduledMinutes =
+      group.hour * 60 + group.minute;
+
+    const int minutesLate =
+      currentMinutes - scheduledMinutes;
+
     if (
-      alarms[index].localDone
+      minutesLate < 0 ||
+      minutesLate > MAX_LATE_TRIGGER_MINUTES
     ) {
       continue;
     }
 
-    int scheduledMinutes =
-      alarms[index].hour *
-        60 +
-      alarms[index].minute;
-
-    int minutesLate =
-      currentMinutes -
-      scheduledMinutes;
-
-    /*
-     * Trigger one minute early through 60 minutes late.
-     * This also allows a waiting group to run after a previous
-     * close-together medication group finishes.
-     */
-    bool insideTriggerWindow =
-      minutesLate >= -1 &&
-      minutesLate <=
-        MAX_LATE_TRIGGER_MINUTES;
-
-    if (!insideTriggerWindow) {
-      continue;
-    }
-
-    Serial.println();
-    Serial.println(
-      "=============================="
-    );
-
-    Serial.println(
-      "ALARM TRIGGERED"
-    );
-
-    Serial.print(
-      "Group: "
-    );
-
-    Serial.println(
-      alarms[index].groupId
-    );
-
-    Serial.print(
-      "Scheduled time: "
-    );
-
-    Serial.println(
-      formatTime(
-        alarms[index].hour,
-        alarms[index].minute
-      )
-    );
-
-    Serial.print(
-      "Minutes late: "
-    );
-
-    Serial.println(
-      minutesLate
-    );
-
-    Serial.println(
-      "=============================="
-    );
-
-    alarmActive =
-      true;
-
-    activeAlarmIndex =
-      static_cast<int>(
-        index
-      );
-
-    currentPhase =
-      0;
-
-    bool dispensed =
-      dispenseMedicine(
-        alarms[index]
-      );
-
-    if (!dispensed) {
-      Serial.println(
-        "Medicine could not be dispensed."
-      );
-
-      resetAlarmState();
-
+    // Reserve room for dispensing and its eventual final event.
+    if (pendingEvents.size() > MAX_PENDING_EVENTS - 2) {
+      Serial.println("Dispensing deferred: backend queue is full.");
       return;
     }
 
-    /*
-     * Queue the event instead of sending it now.
-     * Network operations are processed after the alarm ends.
-     */
-    queueRxBoxEvent(
-      "dispensed",
-      alarms[index],
-      0
-    );
+    group.started = true;
+    alarmActive = true;
+    activeAlarmIndex = static_cast<int>(index);
+    currentPhase = 0;
+    waitingForHand = false;
 
-    /*
-     * Start only after every chamber in the same-time group
-     * has been positioned and dispensed.
-     */
+    Serial.print("DUE GROUP | ");
+    Serial.print(group.groupId);
+    Serial.print(" | Actual ");
+    Serial.print(localTime.tm_hour);
+    Serial.print(":");
+    Serial.print(localTime.tm_min);
+    Serial.print(":");
+    Serial.println(localTime.tm_sec);
+
+    time_t dispensedAt = 0;
+
+    if (!dispenseGroup(group, dispensedAt)) {
+      // Stop instead of automatically retrying a possibly partial dispense.
+      setHardwareFault("Dispensing sequence could not complete.");
+      resetAlarmState();
+      digitalWrite(LED, HIGH);
+      return;
+    }
+
+    if (
+      !queueEvent(
+        "dispensed",
+        group,
+        0,
+        dispensedAt
+      )
+    ) {
+      setHardwareFault("Could not queue dispensing event.");
+      resetAlarmState();
+      digitalWrite(LED, HIGH);
+      return;
+    }
+
+    pickupEnabledAt = millis();
+    lastSensorCheck = pickupEnabledAt;
+    waitingForHand = true;
+
     startBuzzer();
-
     return;
   }
 }
 
-// ======================================================
+// ------------------------------------------------------
 // SETUP
-// ======================================================
+// ------------------------------------------------------
 
 void setup() {
-  Serial.begin(
-    115200
-  );
+  Serial.begin(115200);
 
-  delay(
-    500
-  );
+  pinMode(LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
 
-  Serial.println();
-  Serial.println(
-    "=============================="
-  );
+  digitalWrite(LED, LOW);
+  digitalWrite(BUZZER, LOW);
+  digitalWrite(TRIG_PIN, LOW);
 
-  Serial.println(
-    "BOOTING RX BOX FIRMWARE"
-  );
+  stateMutex = xSemaphoreCreateMutex();
 
-  Serial.println(
-    "=============================="
-  );
+  if (stateMutex == nullptr || !initializeBuzzer()) {
+    Serial.println("ERROR: Firmware initialization failed.");
 
-  pinMode(
-    LED,
-    OUTPUT
-  );
-
-  pinMode(
-    BUZZER,
-    OUTPUT
-  );
-
-  pinMode(
-    TRIG_PIN,
-    OUTPUT
-  );
-
-  pinMode(
-    ECHO_PIN,
-    INPUT
-  );
-
-  digitalWrite(
-    TRIG_PIN,
-    LOW
-  );
-
-  digitalWrite(
-    BUZZER,
-    LOW
-  );
-
-  digitalWrite(
-    LED,
-    LOW
-  );
-
-  carouselServo.setPeriodHertz(
-    50
-  );
-
-  carouselServo.attach(
-    CAROUSEL_SERVO,
-    500,
-    2400
-  );
-
-  Serial.println(
-    "Moving carousel HOME..."
-  );
-
-  carouselServo.write(
-    HOME_POSITION
-  );
-
-  delay(
-    1000
-  );
-
-  currentChamberIndex =
-    0;
+    while (true) {
+      digitalWrite(LED, HIGH);
+      delay(500);
+      digitalWrite(LED, LOW);
+      delay(500);
+    }
+  }
 
   selfTest();
 
-  int wifiAttempts =
-    0;
+  carouselServo.setPeriodHertz(50);
+  carouselServo.attach(CAROUSEL_SERVO, 500, 2400);
 
-  while (
-    WiFi.status() != WL_CONNECTED &&
-    wifiAttempts < 3
-  ) {
-    wifiAttempts++;
-
-    Serial.print(
-      "WiFi attempt "
-    );
-
-    Serial.println(
-      wifiAttempts
-    );
-
-    if (connectWiFi()) {
-      break;
-    }
-
-    delay(
-      1000
-    );
+  if (!carouselServo.attached()) {
+    setHardwareFault("Servo PWM attachment failed.");
+    return;
   }
 
-  if (
-    WiFi.status() == WL_CONNECTED
-  ) {
-    configTime(
-      gmtOffset_sec,
-      daylightOffset_sec,
-      ntpServer
-    );
-
-    Serial.println(
-      "Waiting for NTP time..."
-    );
-
-    struct tm timeinfo;
-
-    if (
-      getLocalTime(
-        &timeinfo,
-        10000
-      )
-    ) {
-      lastDay =
-        timeinfo.tm_mday;
-
-      Serial.print(
-        "Time synchronized: "
-      );
-
-      Serial.print(
-        formatTime(
-          timeinfo.tm_hour,
-          timeinfo.tm_min
-        )
-      );
-
-      Serial.println(
-        " Asia/Manila"
-      );
-    } else {
-      Serial.println(
-        "Initial NTP synchronization timed out."
-      );
-    }
-
-    fetchSchedule();
-
-    lastFetch =
-      millis();
-  } else {
-    Serial.println(
-      "WiFi unavailable. The main loop will retry."
-    );
+  if (!returnCarouselHome()) {
+    setHardwareFault("Initial HOME command failed.");
+    return;
   }
 
-  Serial.println();
-  Serial.println(
-    "=============================="
+  // NTP can synchronize when the network task connects.
+  configTime(
+    GMT_OFFSET_SECONDS,
+    DAYLIGHT_OFFSET_SECONDS,
+    ntpServer
   );
 
-  Serial.println(
-    "RX BOX READY"
+  const BaseType_t created = xTaskCreate(
+    networkTask,
+    "rxNetwork",
+    12288,
+    nullptr,
+    1,
+    &networkTaskHandle
   );
 
-  Serial.println(
-    "=============================="
-  );
+  if (created != pdPASS) {
+    setHardwareFault("Network task could not start.");
+    return;
+  }
+
+  Serial.println("RX BOX READY");
+  Serial.println("Initial alarm = phase 0; first snooze = phase 1.");
 }
 
-// ======================================================
-// MAIN LOOP
-// ======================================================
+// ------------------------------------------------------
+// HARDWARE LOOP
+// ------------------------------------------------------
 
 void loop() {
-  unsigned long now =
-    millis();
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
 
-  /*
-   * Highest priority: active alarm and ultrasonic sensor.
-   *
-   * No WiFi connection, schedule fetch, or HTTP event request
-   * is permitted while alarmActive is true.
-   */
-  if (alarmActive) {
-    processActiveAlarm(
-      now
-    );
-
-    /*
-     * If hand detection or missed processing reset the alarm,
-     * force the physical outputs off immediately.
-     */
-    if (!alarmActive) {
-      buzzerOffSound();
-
-      digitalWrite(
-        LED,
-        LOW
-      );
-    }
-
-    delay(
-      20
-    );
-
-    return;
-  }
-
-  /*
-   * Inactive-alarm physical failsafe.
-   */
-  buzzerOn =
-    false;
-
-  buzzerOffSound();
-
-  digitalWrite(
-    LED,
-    LOW
-  );
-
-  /*
-   * Network work only happens while no alarm is active.
-   */
-  ensureWiFi();
-
-  if (
-    WiFi.status() == WL_CONNECTED
-  ) {
-    processPendingRxBoxEvents();
-
-    /*
-     * processPendingRxBoxEvents() can block during HTTP.
-     * Refresh millis() afterward.
-     */
-    now =
-      millis();
-
-    if (
-      now -
-      lastFetch >=
-      SCHEDULE_FETCH_INTERVAL_MS
-    ) {
-      fetchSchedule();
-
-      lastFetch =
-        millis();
-    }
-  }
-
-  /*
-   * Do not wait several seconds for NTP in the normal loop.
-   */
-  struct tm timeinfo = {};
-
-  bool timeAvailable =
-    getLocalTime(
-      &timeinfo,
-      20
-    );
-
-  if (!timeAvailable) {
-    delay(
-      100
-    );
-
-    return;
-  }
-
-  int hour =
-    timeinfo.tm_hour;
-
-  int minute =
-    timeinfo.tm_min;
-
-  int day =
-    timeinfo.tm_mday;
-
-  // ====================================================
-  // INITIAL DAY / DAILY RESET
-  // ====================================================
-
-  if (lastDay == -1) {
-    lastDay =
-      day;
-  } else if (
-    day != lastDay
-  ) {
-    Serial.println();
-    Serial.println(
-      "=============================="
-    );
-
-    Serial.println(
-      "NEW DAY"
-    );
-
-    Serial.println(
-      "Resetting daily alarm state."
-    );
-
-    Serial.println(
-      "=============================="
-    );
-
-    lastDay =
-      day;
-
-    currentChamberIndex =
-      0;
-
-    returnCarouselHome();
-
-    for (
-      AlarmGroup& alarm :
-      alarms
-    ) {
-      alarm.localDone =
-        false;
-    }
-
-    /*
-     * Load the authoritative schedule and statuses for today.
-     */
-    fetchSchedule();
-
-    lastFetch =
-      millis();
-  }
-
-  // ====================================================
-  // TRIGGER NEXT DUE GROUP
-  // ====================================================
-
-  triggerDueAlarm(
-    hour,
-    minute
-  );
-
-  /*
-   * triggerDueAlarm() may have started a new alarm after
-   * dispensing, so refresh the timestamp before processing it.
-   */
-  if (alarmActive) {
-    now =
-      millis();
-
-    processActiveAlarm(
-      now
-    );
-  }
-
-  /*
-   * Final physical failsafe.
-   */
-  if (
-    !alarmActive ||
-    !buzzerOn
-  ) {
+  if (hardwareFault) {
     buzzerOffSound();
+    digitalWrite(LED, HIGH);
+
+    xSemaphoreGive(stateMutex);
+    delay(20);
+    return;
   }
 
-  digitalWrite(
-    LED,
-    alarmActive &&
-    buzzerOn
-      ? HIGH
-      : LOW
-  );
+  if (alarmActive) {
+    processActiveAlarm();
+  } else {
+    buzzerOffSound();
+    digitalWrite(LED, LOW);
 
-  delay(
-    20
-  );
+    struct tm localTime = {};
+
+    if (readClock(localTime)) {
+      triggerDueAlarm(localTime);
+    }
+  }
+
+  xSemaphoreGive(stateMutex);
+
+  delay(10);
 }
