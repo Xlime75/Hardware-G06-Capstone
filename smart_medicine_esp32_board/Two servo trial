@@ -11,19 +11,28 @@
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 
-// ------------------------------------------------------
-// CONFIGURATION
-// ------------------------------------------------------
+// ======================================================
+// PIN CONFIGURATION
+// ======================================================
 
 #define LED 22
 #define BUZZER 25
 #define CAROUSEL_SERVO 18
-#define GATE_SERVO 19
-#define PICKUP_SENSOR_PIN 23
+#define GATE_SERVO 23
+#define TRIG_PIN 5
+#define ECHO_PIN 19
+
+// ======================================================
+// NETWORK CONFIGURATION
+// Preserved from your supplied firmware.
+// ======================================================
 
 const char* ssid = "JC's Iphone 16 Pro Max";
 const char* password = "123456789";
-const char* sensorApiKey = "53915057352185cee50fe0514d87f253999fc447f9473b718184955dfbe48711";
+
+const char* sensorApiKey =
+  "53915057352185cee50fe0514d87f253999fc447f9473b718184955dfbe48711";
+
 const char* deviceID = "box_1";
 
 const char* scheduleURL =
@@ -33,6 +42,7 @@ const char* eventURL =
   "https://med-reminder-web-app.vercel.app/api/esp32/event";
 
 const char* ntpServer = "pool.ntp.org";
+
 const long GMT_OFFSET_SECONDS = 8 * 3600;
 const int DAYLIGHT_OFFSET_SECONDS = 0;
 const time_t MIN_VALID_TIME = 1704067200LL;
@@ -45,38 +55,67 @@ const unsigned long SCHEDULE_FETCH_INTERVAL_MS = 30000;
 
 const size_t MAX_PENDING_EVENTS = 16;
 
-// The carousel is a continuous-rotation 360-degree servo.
-// IMPORTANT: At startup, manually align Chamber 1 with the outlet.
-// These timings must be calibrated on the actual assembled carousel.
-const int NUMBER_OF_CHAMBERS = 3;
-const int CAROUSEL_STOP_US = 1500;
+// ======================================================
+// DUAL-SERVO CONFIGURATION
+//
+// Four equally spaced chambers: 90 degrees per chamber.
+//
+// A continuous-rotation servo does not accept an absolute
+// chamber angle. Pulse width controls rotation direction
+// and speed; elapsed time estimates the distance moved.
+//
+// Physically align Chamber 1 with the outlet before boot.
+//
+// These are initial estimates, not measured calibration.
+// Calibrate both directions and the neutral pulse on the
+// actual assembled mechanism.
+// ======================================================
+
+const int NUMBER_OF_CHAMBERS = 4;
+
+const int CAROUSEL_STOP_US = 1480;
 const int CAROUSEL_CW_US = 1700;
 const int CAROUSEL_CCW_US = 1300;
-const unsigned long CAROUSEL_120_DEG_MS = 900; // CALIBRATE THIS VALUE
+
+const unsigned long CAROUSEL_CW_90_MS = 900;
+const unsigned long CAROUSEL_CCW_90_MS = 675;
 const unsigned long CAROUSEL_SETTLE_TIME_MS = 250;
 
-// 180-degree gate servo positions. Adjust for the physical gate linkage.
+// Adjust these angles to match the physical gate linkage.
 const int GATE_CLOSED_ANGLE = 0;
 const int GATE_OPEN_ANGLE = 90;
+
 const unsigned long GATE_SETTLE_TIME_MS = 400;
 const unsigned long DISPENSE_DELAY_MS = 1500;
 
-// MLE00536 digital output: change to HIGH if your module signals detection HIGH.
-const int PICKUP_ACTIVE_LEVEL = LOW;
+// ======================================================
+// ULTRASONIC PICKUP CONFIGURATION
+// Preserved from the working single-servo firmware.
+// ======================================================
+
+const float MIN_HAND_DISTANCE_CM = 2.0;
+const float MAX_HAND_DISTANCE_CM = 7.0;
+
 const unsigned long SENSOR_SETTLE_MS = 700;
 const unsigned long SENSOR_CHECK_INTERVAL_MS = 100;
+const unsigned long SENSOR_ECHO_TIMEOUT_US = 10000;
+
+// ======================================================
+// ALARM CONFIGURATION
+// ======================================================
 
 const unsigned long ALARM_DURATION_MS = 60000;
 const unsigned long SNOOZE_WAIT_MS = 300000;
+
 const int MAX_SNOOZES = 2;
 const int MAX_LATE_TRIGGER_MINUTES = 60;
 
-// A 250 us half-period produces an approximately 2000 Hz tone.
+// 250 microseconds per half-period = approximately 2000 Hz.
 const uint64_t BUZZER_HALF_PERIOD_US = 250;
 
-// ------------------------------------------------------
-// DATA
-// ------------------------------------------------------
+// ======================================================
+// DATA STRUCTURES
+// ======================================================
 
 struct AlarmGroup {
   String groupId;
@@ -114,13 +153,26 @@ bool queueEvent(
 
 bool postEvent(const PendingRxBoxEvent& event);
 bool validateGroup(const AlarmGroup& group);
-bool dispenseGroup(const AlarmGroup& group, time_t& dispensedAt);
+
+bool dispenseGroup(
+  const AlarmGroup& group,
+  time_t& dispensedAt
+);
+
+// ======================================================
+// GLOBAL STATE
+// ======================================================
 
 Servo carouselServo;
 Servo gateServo;
 
-// Software position estimate. Chamber 1 must be physically aligned at boot.
+// This is an estimate, not measured position feedback.
 int currentCarouselChamber = 1;
+
+// These flags describe completed commands and waits,
+// not physically measured gate or carousel positions.
+bool gateClosed = false;
+bool carouselStopped = true;
 
 SemaphoreHandle_t stateMutex = nullptr;
 TaskHandle_t networkTaskHandle = nullptr;
@@ -149,18 +201,21 @@ unsigned long lastSensorCheck = 0;
 esp_timer_handle_t buzzerTimer = nullptr;
 
 portMUX_TYPE buzzerMux = portMUX_INITIALIZER_UNLOCKED;
+
 bool buzzerEnabled = false;
 bool buzzerLevel = false;
 
-// ------------------------------------------------------
+// ======================================================
 // BUZZER
-// ------------------------------------------------------
+// Uses esp_timer independently of servo PWM.
+// ======================================================
 
 void buzzerTimerCallback(void*) {
   portENTER_CRITICAL(&buzzerMux);
 
   if (buzzerEnabled) {
     buzzerLevel = !buzzerLevel;
+
     gpio_set_level(
       static_cast<gpio_num_t>(BUZZER),
       buzzerLevel ? 1 : 0
@@ -172,9 +227,12 @@ void buzzerTimerCallback(void*) {
 
 void buzzerOffSound() {
   portENTER_CRITICAL(&buzzerMux);
+
   buzzerEnabled = false;
   buzzerLevel = false;
+
   gpio_set_level(static_cast<gpio_num_t>(BUZZER), 0);
+
   portEXIT_CRITICAL(&buzzerMux);
 
   if (buzzerTimer != nullptr) {
@@ -214,11 +272,15 @@ void buzzerOnSound() {
 
 bool initializeBuzzer() {
   esp_timer_create_args_t arguments = {};
+
   arguments.callback = buzzerTimerCallback;
   arguments.dispatch_method = ESP_TIMER_TASK;
   arguments.name = "rxBuzzer";
 
-  return esp_timer_create(&arguments, &buzzerTimer) == ESP_OK;
+  return esp_timer_create(
+    &arguments,
+    &buzzerTimer
+  ) == ESP_OK;
 }
 
 void selfTest() {
@@ -235,9 +297,9 @@ void selfTest() {
   }
 }
 
-// ------------------------------------------------------
+// ======================================================
 // CLOCK
-// ------------------------------------------------------
+// ======================================================
 
 bool readClock(struct tm& localTime) {
   const time_t now = time(nullptr);
@@ -262,13 +324,26 @@ String dateKey(const struct tm& localTime) {
   return String(buffer);
 }
 
-// ------------------------------------------------------
-// MOTOR
-// ------------------------------------------------------
+// ======================================================
+// MOTOR CONTROL
+// ======================================================
 
 void setHardwareFault(const char* message) {
+  // Issue stop and close commands when possible.
+  if (carouselServo.attached()) {
+    carouselServo.writeMicroseconds(CAROUSEL_STOP_US);
+  }
+
+  if (gateServo.attached()) {
+    gateServo.write(GATE_CLOSED_ANGLE);
+  }
+
+  carouselStopped = true;
+  gateClosed = false;
+
   hardwareFault = true;
   systemArmed = false;
+
   buzzerOffSound();
   digitalWrite(LED, HIGH);
 
@@ -277,72 +352,139 @@ void setHardwareFault(const char* message) {
 }
 
 bool stopCarousel() {
-  if (!carouselServo.attached()) return false;
+  if (!carouselServo.attached()) {
+    return false;
+  }
+
   carouselServo.writeMicroseconds(CAROUSEL_STOP_US);
   delay(CAROUSEL_SETTLE_TIME_MS);
+
+  carouselStopped = true;
   return true;
 }
 
 bool rotateCarouselSteps(int direction, int steps) {
-  if (!carouselServo.attached() || steps < 0) return false;
-  if (steps == 0) return stopCarousel();
+  if (
+    !carouselServo.attached() ||
+    !gateClosed ||
+    steps < 0 ||
+    steps > 2
+  ) {
+    return false;
+  }
 
-  const int pulse = (direction > 0) ? CAROUSEL_CW_US : CAROUSEL_CCW_US;
-  const unsigned long rotationTime = CAROUSEL_120_DEG_MS * (unsigned long)steps;
+  if (steps == 0) {
+    return stopCarousel();
+  }
+
+  const int pulse =
+    direction > 0 ? CAROUSEL_CW_US : CAROUSEL_CCW_US;
+
+  const unsigned long timePerStep =
+    direction > 0
+      ? CAROUSEL_CW_90_MS
+      : CAROUSEL_CCW_90_MS;
+
+  const unsigned long rotationTime =
+    timePerStep * static_cast<unsigned long>(steps);
 
   Serial.print("CAROUSEL ROTATE | Direction: ");
   Serial.print(direction > 0 ? "CW" : "CCW");
-  Serial.print(" | 120-degree steps: ");
+  Serial.print(" | 90-degree steps: ");
   Serial.print(steps);
   Serial.print(" | Duration ms: ");
   Serial.println(rotationTime);
 
+  carouselStopped = false;
+
   carouselServo.writeMicroseconds(pulse);
   delay(rotationTime);
+
   return stopCarousel();
 }
 
 bool moveCarouselToChamber(int chamberId) {
-  if (chamberId < 1 || chamberId > NUMBER_OF_CHAMBERS) return false;
-  if (!carouselServo.attached()) return false;
+  if (
+    chamberId < 1 ||
+    chamberId > NUMBER_OF_CHAMBERS ||
+    !carouselServo.attached()
+  ) {
+    return false;
+  }
 
   buzzerOffSound();
 
-  // Choose the shorter direction around the 3-position carousel.
   const int targetIndex = chamberId - 1;
   const int currentIndex = currentCarouselChamber - 1;
-  const int clockwiseSteps = (targetIndex - currentIndex + NUMBER_OF_CHAMBERS) % NUMBER_OF_CHAMBERS;
-  const int counterClockwiseSteps = (currentIndex - targetIndex + NUMBER_OF_CHAMBERS) % NUMBER_OF_CHAMBERS;
 
+  const int clockwiseSteps =
+    (
+      targetIndex -
+      currentIndex +
+      NUMBER_OF_CHAMBERS
+    ) % NUMBER_OF_CHAMBERS;
+
+  const int counterClockwiseSteps =
+    (
+      currentIndex -
+      targetIndex +
+      NUMBER_OF_CHAMBERS
+    ) % NUMBER_OF_CHAMBERS;
+
+  // Use the shorter route. A 180-degree tie uses CW.
   if (clockwiseSteps <= counterClockwiseSteps) {
-    if (!rotateCarouselSteps(1, clockwiseSteps)) return false;
+    if (!rotateCarouselSteps(1, clockwiseSteps)) {
+      return false;
+    }
   } else {
-    if (!rotateCarouselSteps(-1, counterClockwiseSteps)) return false;
+    if (!rotateCarouselSteps(-1, counterClockwiseSteps)) {
+      return false;
+    }
   }
 
   currentCarouselChamber = chamberId;
+
   Serial.print("CAROUSEL POSITION ESTIMATE: Chamber ");
   Serial.println(currentCarouselChamber);
+
   return true;
 }
 
 bool openGate() {
-  if (!gateServo.attached()) return false;
+  if (
+    !gateServo.attached() ||
+    !carouselStopped ||
+    hardwareFault
+  ) {
+    return false;
+  }
+
+  gateClosed = false;
+
   gateServo.write(GATE_OPEN_ANGLE);
   delay(GATE_SETTLE_TIME_MS);
+
   return true;
 }
 
 bool closeGate() {
-  if (!gateServo.attached()) return false;
+  if (!gateServo.attached()) {
+    return false;
+  }
+
+  gateClosed = false;
+
   gateServo.write(GATE_CLOSED_ANGLE);
   delay(GATE_SETTLE_TIME_MS);
+
+  gateClosed = true;
   return true;
 }
 
 bool validateGroup(const AlarmGroup& group) {
   if (
     group.groupId.isEmpty() ||
+    group.scheduledTime.isEmpty() ||
     group.hour < 0 ||
     group.hour > 23 ||
     group.minute < 0 ||
@@ -354,60 +496,130 @@ bool validateGroup(const AlarmGroup& group) {
   }
 
   bool used[NUMBER_OF_CHAMBERS] = {};
+
   for (int chamberId : group.chamberIds) {
-    if (chamberId < 1 || chamberId > NUMBER_OF_CHAMBERS || used[chamberId - 1]) {
+    if (
+      chamberId < 1 ||
+      chamberId > NUMBER_OF_CHAMBERS ||
+      used[chamberId - 1]
+    ) {
       return false;
     }
+
     used[chamberId - 1] = true;
   }
+
   return true;
 }
 
-bool dispenseGroup(const AlarmGroup& group, time_t& dispensedAt) {
+bool dispenseGroup(
+  const AlarmGroup& group,
+  time_t& dispensedAt
+) {
   dispensedAt = 0;
-  if (!validateGroup(group) || !carouselServo.attached() || !gateServo.attached()) {
+
+  if (
+    !validateGroup(group) ||
+    !carouselServo.attached() ||
+    !gateServo.attached()
+  ) {
     return false;
   }
 
-  // Keep the gate closed before moving to any tower.
-  if (!closeGate()) return false;
-
-  for (int chamberId : group.chamberIds) {
-    if (!moveCarouselToChamber(chamberId)) return false;
-
-    Serial.print("DISPENSING | Tower/Chamber ");
-    Serial.println(chamberId);
-
-    if (!openGate()) return false;
-    delay(DISPENSE_DELAY_MS);
-    if (!closeGate()) return false;
+  // Close and allow the gate to settle before moving.
+  if (!closeGate()) {
+    return false;
   }
 
-  // Keep the carousel at its last known chamber; do not issue a false HOME angle
-  // to a continuous-rotation servo.
+  // Use the API's assigned chamber IDs directly.
+  // Scheduled time controls WHEN, not WHICH chamber.
+  for (int chamberId : group.chamberIds) {
+    if (!moveCarouselToChamber(chamberId)) {
+      return false;
+    }
+
+    Serial.print("DISPENSING | Chamber ");
+    Serial.println(chamberId);
+
+    // moveCarouselToChamber has already issued STOP
+    // and completed its settling delay.
+    if (!openGate()) {
+      return false;
+    }
+
+    delay(DISPENSE_DELAY_MS);
+
+    // Finish closing before another chamber can move.
+    if (!closeGate()) {
+      return false;
+    }
+  }
+
+  // Do not send a positional HOME angle to a
+  // continuous-rotation servo.
   dispensedAt = time(nullptr);
-  Serial.println("Dispensing sequence completed; gate closed.");
+
+  Serial.println(
+    "Dispensing sequence completed; gate closed."
+  );
+
   return true;
 }
 
-// ------------------------------------------------------
-// PICKUP SENSOR (MLE00536 DIGITAL IR MODULE)
-// ------------------------------------------------------
+// ======================================================
+// PICKUP SENSOR
+// Same ultrasonic detection as the working reference.
+// ======================================================
+
+float getDistanceCM() {
+  // A stuck-high echo is an invalid measurement.
+  if (digitalRead(ECHO_PIN) == HIGH) {
+    return -1.0;
+  }
+
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  const unsigned long duration = pulseIn(
+    ECHO_PIN,
+    HIGH,
+    SENSOR_ECHO_TIMEOUT_US
+  );
+
+  if (duration == 0) {
+    return -1.0;
+  }
+
+  return duration * 0.0343f / 2.0f;
+}
 
 bool detectHand() {
-  const int sensorState = digitalRead(PICKUP_SENSOR_PIN);
-  if (sensorState == PICKUP_ACTIVE_LEVEL) {
-    Serial.println("PICKUP | IR sensor detected an object/hand.");
+  const float distance = getDistanceCM();
+
+  // One valid reading for every chamber and alarm phase.
+  if (
+    distance >= MIN_HAND_DISTANCE_CM &&
+    distance <= MAX_HAND_DISTANCE_CM
+  ) {
+    Serial.print("PICKUP | Distance ");
+    Serial.print(distance, 2);
+    Serial.println(" cm");
+
     return true;
   }
+
   return false;
 }
 
-// ------------------------------------------------------
+// ======================================================
 // EVENT QUEUE
-//
-// These functions are called while stateMutex is held.
-// ------------------------------------------------------
+// Queue modifications require stateMutex.
+// ======================================================
 
 String createEventId(
   const String& status,
@@ -422,11 +634,13 @@ bool queueEvent(
   int snoozeCount,
   time_t dispensedAt
 ) {
-  const String eventId = createEventId(String(status), group);
+  const String eventId =
+    createEventId(String(status), group);
 
   for (const PendingRxBoxEvent& existing : pendingEvents) {
     if (
-      createEventId(existing.status, existing.group) == eventId
+      createEventId(existing.status, existing.group) ==
+      eventId
     ) {
       return true;
     }
@@ -438,6 +652,7 @@ bool queueEvent(
   }
 
   PendingRxBoxEvent event;
+
   event.status = status;
   event.group = group;
   event.planId = currentPlanId;
@@ -523,7 +738,8 @@ bool processOneNetworkEvent() {
 
   xSemaphoreTake(stateMutex, portMAX_DELAY);
 
-  // Preserve event order. A final status cannot overtake dispensing.
+  // Preserve ordering: final status cannot overtake
+  // its preceding dispensing event.
   if (!pendingEvents.empty()) {
     PendingRxBoxEvent& first = pendingEvents.front();
 
@@ -535,6 +751,7 @@ bool processOneNetworkEvent() {
     ) {
       first.attempted = true;
       first.lastAttempt = now;
+
       event = first;
       available = true;
     }
@@ -546,7 +763,8 @@ bool processOneNetworkEvent() {
     return false;
   }
 
-  // No state lock is held during HTTP.
+  // HTTP runs without the hardware state lock.
+  // Sensor checks and alarms can continue.
   if (postEvent(event)) {
     const String eventId =
       createEventId(event.status, event.group);
@@ -571,9 +789,9 @@ bool processOneNetworkEvent() {
   return true;
 }
 
-// ------------------------------------------------------
+// ======================================================
 // SCHEDULE
-// ------------------------------------------------------
+// ======================================================
 
 void fetchSchedule() {
   HTTPClient http;
@@ -589,6 +807,7 @@ void fetchSchedule() {
   http.setTimeout(HTTP_READ_TIMEOUT_MS);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.setReuse(false);
+
   http.addHeader("x-sensor-key", sensorApiKey);
 
   const int code = http.GET();
@@ -596,6 +815,7 @@ void fetchSchedule() {
   if (code != 200 && code != 409) {
     Serial.print("Schedule HTTP error: ");
     Serial.println(code);
+
     http.end();
     return;
   }
@@ -631,6 +851,8 @@ void fetchSchedule() {
       return;
     }
 
+    bool assigned[NUMBER_OF_CHAMBERS] = {};
+
     for (JsonObject object : doc["groups"].as<JsonArray>()) {
       AlarmGroup group;
 
@@ -641,10 +863,20 @@ void fetchSchedule() {
         object["scheduledTime"].as<String>();
       group.status = object["status"].as<String>();
 
+      if (!object["chamberIds"].is<JsonArray>()) {
+        Serial.println("Invalid chamber array rejected.");
+        return;
+      }
+
       for (
         JsonVariant value :
         object["chamberIds"].as<JsonArray>()
       ) {
+        if (!value.is<int>()) {
+          Serial.println("Non-integer chamber ID rejected.");
+          return;
+        }
+
         group.chamberIds.push_back(value.as<int>());
       }
 
@@ -653,10 +885,17 @@ void fetchSchedule() {
         return;
       }
 
-      // A chamber may appear in multiple schedule groups during the day.
-      // validateGroup() already rejects duplicate chamber IDs inside one group.
+      for (int chamberId : group.chamberIds) {
+        if (assigned[chamberId - 1]) {
+          Serial.println("Duplicate chamber assignment rejected.");
+          return;
+        }
 
-      // A server-recorded dispense must not dispense again after reboot.
+        assigned[chamberId - 1] = true;
+      }
+
+      // Prevent replay when the server already records
+      // dispensing or a final outcome.
       group.started =
         group.status == "dispensed" ||
         group.status == "taken" ||
@@ -683,7 +922,7 @@ void fetchSchedule() {
 
   xSemaphoreTake(stateMutex, portMAX_DELAY);
 
-  // A refresh must never replace the active alarm's group.
+  // Never replace an active alarm's group.
   if (!alarmActive && !hardwareFault) {
     if (planDate == currentPlanDate) {
       for (AlarmGroup& group : loaded) {
@@ -698,6 +937,7 @@ void fetchSchedule() {
     }
 
     alarms.swap(loaded);
+
     currentPlanId = planId;
     currentPlanDate = planDate;
     systemArmed = enabled;
@@ -711,13 +951,14 @@ void fetchSchedule() {
   xSemaphoreGive(stateMutex);
 }
 
-// ------------------------------------------------------
+// ======================================================
 // NETWORK TASK
-// ------------------------------------------------------
+// ======================================================
 
 void networkTask(void*) {
   unsigned long lastWiFiAttempt = 0;
   unsigned long lastFetch = 0;
+
   bool attemptedWiFi = false;
   bool fetched = false;
 
@@ -754,10 +995,14 @@ void networkTask(void*) {
     if (
       !processedEvent &&
       mayFetch &&
-      (!fetched || millis() - lastFetch >= SCHEDULE_FETCH_INTERVAL_MS)
+      (
+        !fetched ||
+        millis() - lastFetch >= SCHEDULE_FETCH_INTERVAL_MS
+      )
     ) {
       fetched = true;
       lastFetch = millis();
+
       fetchSchedule();
     }
 
@@ -765,11 +1010,10 @@ void networkTask(void*) {
   }
 }
 
-// ------------------------------------------------------
+// ======================================================
 // ALARM
-//
-// Called only by the main loop while stateMutex is held.
-// ------------------------------------------------------
+// Called by the main loop while stateMutex is held.
+// ======================================================
 
 void resetAlarmState() {
   alarmActive = false;
@@ -793,6 +1037,7 @@ void startBuzzer() {
 
 void completeAlarm(bool taken) {
   buzzerOn = false;
+
   buzzerOffSound();
   digitalWrite(LED, LOW);
 
@@ -820,8 +1065,9 @@ void completeAlarm(bool taken) {
 
   group.localDone = true;
 
-  // Continuous-rotation carousel has no absolute HOME angle.
-  // Keep the last chamber position estimate; startup alignment is manual.
+  // Leave the carousel at its last estimated chamber.
+  // Sending write(0) would rotate a continuous servo;
+  // it would not return the carousel to HOME.
 
   resetAlarmState();
 
@@ -836,7 +1082,9 @@ void processActiveAlarm() {
   if (buzzerOn) {
     if (now - buzzerStartedAt >= ALARM_DURATION_MS) {
       buzzerOn = false;
+
       buzzerOffSound();
+
       snoozeStartedAt = millis();
       Serial.println("Snooze wait started.");
     } else {
@@ -853,6 +1101,8 @@ void processActiveAlarm() {
 
   now = millis();
 
+  // Pickup remains active during both the buzzer
+  // and silent snooze periods.
   if (
     waitingForHand &&
     now - pickupEnabledAt >= SENSOR_SETTLE_MS &&
@@ -866,7 +1116,8 @@ void processActiveAlarm() {
     }
   }
 
-  // Refresh after sensor reads and after snoozeStartedAt changes.
+  // Refresh after sensor reads and after snoozeStartedAt
+  // changes, preserving the reference timing fix.
   now = millis();
 
   if (
@@ -919,13 +1170,16 @@ void triggerDueAlarm(const struct tm& localTime) {
       continue;
     }
 
-    // Reserve room for dispensing and its eventual final event.
+    // Reserve room for dispensing and its final outcome.
     if (pendingEvents.size() > MAX_PENDING_EVENTS - 2) {
-      Serial.println("Dispensing deferred: backend queue is full.");
+      Serial.println(
+        "Dispensing deferred: backend queue is full."
+      );
       return;
     }
 
     group.started = true;
+
     alarmActive = true;
     activeAlarmIndex = static_cast<int>(index);
     currentPhase = 0;
@@ -943,8 +1197,12 @@ void triggerDueAlarm(const struct tm& localTime) {
     time_t dispensedAt = 0;
 
     if (!dispenseGroup(group, dispensedAt)) {
-      // Stop instead of automatically retrying a possibly partial dispense.
-      setHardwareFault("Dispensing sequence could not complete.");
+      // Do not automatically retry a possibly
+      // partially completed dispensing sequence.
+      setHardwareFault(
+        "Dispensing sequence could not complete."
+      );
+
       resetAlarmState();
       digitalWrite(LED, HIGH);
       return;
@@ -958,12 +1216,17 @@ void triggerDueAlarm(const struct tm& localTime) {
         dispensedAt
       )
     ) {
-      setHardwareFault("Could not queue dispensing event.");
+      setHardwareFault(
+        "Could not queue dispensing event."
+      );
+
       resetAlarmState();
       digitalWrite(LED, HIGH);
       return;
     }
 
+    // Start pickup monitoring only after all assigned
+    // chambers have completed dispensing and gate closure.
     pickupEnabledAt = millis();
     lastSensorCheck = pickupEnabledAt;
     waitingForHand = true;
@@ -973,19 +1236,21 @@ void triggerDueAlarm(const struct tm& localTime) {
   }
 }
 
-// ------------------------------------------------------
+// ======================================================
 // SETUP
-// ------------------------------------------------------
+// ======================================================
 
 void setup() {
   Serial.begin(115200);
 
   pinMode(LED, OUTPUT);
   pinMode(BUZZER, OUTPUT);
-  pinMode(PICKUP_SENSOR_PIN, INPUT_PULLUP);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
 
   digitalWrite(LED, LOW);
   digitalWrite(BUZZER, LOW);
+  digitalWrite(TRIG_PIN, LOW);
 
   stateMutex = xSemaphoreCreateMutex();
 
@@ -995,35 +1260,47 @@ void setup() {
     while (true) {
       digitalWrite(LED, HIGH);
       delay(500);
+
       digitalWrite(LED, LOW);
       delay(500);
     }
   }
 
-  selfTest();
-
   carouselServo.setPeriodHertz(50);
   carouselServo.attach(CAROUSEL_SERVO, 500, 2500);
+
+  // Issue neutral immediately after attaching.
+  if (carouselServo.attached()) {
+    carouselServo.writeMicroseconds(CAROUSEL_STOP_US);
+  }
 
   gateServo.setPeriodHertz(50);
   gateServo.attach(GATE_SERVO, 500, 2500);
 
-  if (!carouselServo.attached() || !gateServo.attached()) {
+  if (
+    !carouselServo.attached() ||
+    !gateServo.attached()
+  ) {
     setHardwareFault("Servo PWM attachment failed.");
     return;
   }
 
-  // A continuous-rotation servo has no absolute HOME angle.
-  // Manually align Chamber 1 with the outlet before powering the box.
-  carouselServo.writeMicroseconds(CAROUSEL_STOP_US);
+  // No automatic homing is possible with the current
+  // hardware because it has no position reference sensor.
   currentCarouselChamber = 1;
-  if (!closeGate()) {
-    setHardwareFault("Initial gate-close command failed.");
+
+  if (!stopCarousel() || !closeGate()) {
+    setHardwareFault("Initial motor setup failed.");
     return;
   }
-  Serial.println("STARTUP POSITION ASSUMPTION: Chamber 1 is aligned with outlet.");
 
-  // NTP can synchronize when the network task connects.
+  Serial.println(
+    "STARTUP ASSUMPTION: Chamber 1 physically aligned with outlet."
+  );
+
+  selfTest();
+
+  // NTP synchronizes after the network task connects.
   configTime(
     GMT_OFFSET_SECONDS,
     DAYLIGHT_OFFSET_SECONDS,
@@ -1045,14 +1322,15 @@ void setup() {
   }
 
   Serial.println("RX BOX READY");
-  Serial.println("Carousel: 3 towers, timed continuous rotation.");
-  Serial.println("Gate: 180-degree servo; pickup: digital IR sensor.");
+  Serial.println("Carousel: four chambers, timed continuous rotation.");
+  Serial.println("Gate servo: GPIO 23.");
+  Serial.println("Pickup: ultrasonic TRIG 5 / ECHO 19.");
   Serial.println("Initial alarm = phase 0; first snooze = phase 1.");
 }
 
-// ------------------------------------------------------
+// ======================================================
 // HARDWARE LOOP
-// ------------------------------------------------------
+// ======================================================
 
 void loop() {
   xSemaphoreTake(stateMutex, portMAX_DELAY);
@@ -1062,6 +1340,7 @@ void loop() {
     digitalWrite(LED, HIGH);
 
     xSemaphoreGive(stateMutex);
+
     delay(20);
     return;
   }
