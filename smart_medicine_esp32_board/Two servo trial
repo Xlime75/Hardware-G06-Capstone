@@ -27,7 +27,7 @@
 // Preserved from your supplied firmware.
 // ======================================================
 
-const char* ssid = "JC's Iphone 16 Pro Max";
+const char* ssid = "Samsung S23";
 const char* password = "123456789";
 
 const char* sensorApiKey =
